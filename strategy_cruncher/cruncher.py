@@ -1,7 +1,10 @@
-# Dave Mabe Style Iterative Strategy Cruncher - One Rule At A Time
+# =====================================================
+# Dave Mabe Style Iterative Strategy Cruncher
+# One wide-net backtest -> Smart Filter Phase
+# =====================================================
 #
-# Run one wide-net backtest → add column library → cruncher finds best single rule
-# → apply it → re-crunch remaining columns → repeat until no more good rules.
+# Run one wide-net backtest -> add column library -> cruncher finds best single rule
+# -> apply it -> re-crunch remaining columns -> repeat until no more good rules.
 #
 # Inspired by Dave Mabe's Filter Phase: iterative, one-rule-at-a-time, super explainable.
 
@@ -157,13 +160,16 @@ class StrategyCruncher:
         """Auto-detect entry-only columns (exclude exit/MFE/MAE/UnrealizedPL, etc.)."""
         exit_substrings = [
             "MFE", "MAE", "UnrealizedPL", "DistToInitialStop", "BarsTo",
-            "MaxDrawdownFromMFE", "MaxFavorableExcursion", "MaxAdverseExcursion"
+            "BarsToMFE", "BarsToMAE", "MaxDrawdownFromMFE",
+            "MaxFavorableExcursion", "MaxAdverseExcursion",
+            "Exit", "Hold", "holding_minutes", "entry_time", "exit_time",
+            "holding", "Unrealized", "Realized"
         ]
         entry_cols = []
         for c in df.columns:
             if not c.startswith("Col_"):
                 continue
-            if any(x in c for x in exit_substrings):
+            if any(x.lower() in c.lower() for x in exit_substrings):
                 continue
             if not pd.api.types.is_numeric_dtype(df[c]):
                 continue
@@ -181,11 +187,11 @@ class StrategyCruncher:
         min_improvement_pct: float = 8.0,
         max_rules: int = 8,
         verbose: bool = True
-    ) -> Tuple[List[Dict], pd.DataFrame]:
+    ) -> Tuple[List[Dict], pd.DataFrame, np.ndarray, np.ndarray]:
         """
         Dave Mabe style iterative Filter Phase: one rule at a time.
         
-        Finds best single rule → applies it → re-crunches remaining columns → repeat.
+        Finds best single rule -> applies it -> re-crunches remaining columns -> repeat.
         
         Args:
             df: Backtest DataFrame
@@ -197,7 +203,11 @@ class StrategyCruncher:
             verbose: Print progress to stdout
             
         Returns:
-            (rules, filtered_df) - rules is list of rule dicts
+            (rules, filtered_df, before_curve, after_curve)
+            - rules: list of applied rule dicts
+            - filtered_df: trades remaining after all rules
+            - before_curve: cumulative P&L of original trades
+            - after_curve: cumulative P&L of filtered trades
         """
         if pnl_column not in df.columns:
             raise ValueError(f"PnL column '{pnl_column}' not found. Available: {list(df.columns)}")
@@ -211,10 +221,13 @@ class StrategyCruncher:
         current_df = df.copy()
         baseline = self._calculate_metric(current_df, target_metric, pnl_column)
         results: List[Dict] = []
+        before_curve = np.cumsum(df[pnl_column].values) if pnl_column in df.columns else np.array([])
         
         if verbose:
             n0 = len(current_df)
-            print(f"Baseline {target_metric}: {baseline:.3f} | Trades: {n0}")
+            metric_label = target_metric.replace("_", " ").title()
+            print(f"\n=== Dave Mabe Iterative Filter Phase ===")
+            print(f"Baseline {metric_label}: {baseline:.3f} | Trades: {n0:,}\n")
         
         for rule_num in range(1, max_rules + 1):
             best_rule = None
@@ -290,17 +303,22 @@ class StrategyCruncher:
             baseline = best_rule["new_metric"]
             
             if verbose:
-                print(f"Rule {rule_num}: {col} {best_rule['direction']} {thresh} -> "
-                      f"{best_rule['new_metric']:.3f} (+{best_rule['improvement_pct']}%) | "
-                      f"Trades: {best_rule['trades_remaining']}")
+                dir_sym = best_rule['direction']
+                pf = best_rule['new_metric']
+                imp = best_rule['improvement_pct']
+                n_tr = best_rule['trades_remaining']
+                print(f"Rule {rule_num}: {col} {dir_sym} {thresh}   -> PF {pf:.2f} (+{imp:.0f}%) | Trades: {n_tr:,}")
+        
+        after_curve = np.cumsum(current_df[pnl_column].values) if len(current_df) > 0 else np.array([])
         
         if verbose and results:
             initial_metric = self._calculate_metric(df, target_metric, pnl_column)
             final_metric = self._calculate_metric(current_df, target_metric, pnl_column)
             pct = (final_metric - initial_metric) / (abs(initial_metric) or 1e-9) * 100
-            print(f"\nFinal: {len(results)} rules applied. {target_metric} {initial_metric:.3f} -> {final_metric:.3f} ({pct:+.1f}% edge)")
+            print(f"\nFinal Strategy: {len(results)} rules | PF {final_metric:.2f} (+{pct:.0f}%) | Trades: {len(current_df):,}")
+            print("=" * 60)
         
-        return results, current_df
+        return results, current_df, before_curve, after_curve
 
     def _crunch_rules_to_rule_candidates(
         self, crunch_rules: List[Dict], baseline_metrics: Dict
@@ -375,7 +393,7 @@ class StrategyCruncher:
 
         if iterative:
             # Dave Mabe style: delegate to crunch(), convert to OptimizationResult
-            crunch_rules, filtered_df = self.crunch(
+            crunch_rules, filtered_df, _, _ = self.crunch(
                 df,
                 pnl_column=pnl_column,
                 target_metric="profit_factor",

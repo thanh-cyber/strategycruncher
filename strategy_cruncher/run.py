@@ -38,14 +38,28 @@ def main():
         # Run command-line analysis
         from strategy_cruncher import StrategyCruncher
 
-        # Parse non-flag args (avoid --legacy, --library, etc. as csv/pnl)
-        non_flags = [a for a in sys.argv[1:] if not a.startswith('-')]
-        if not non_flags:
+        # Parse positional args while skipping values for known flags.
+        raw_args = sys.argv[1:]
+        flags_with_value = {'--library', '-l', '--max-rules', '--min-improvement'}
+        positionals = []
+        i = 0
+        while i < len(raw_args):
+            arg = raw_args[i]
+            if arg in flags_with_value:
+                i += 2
+                continue
+            if arg.startswith('-'):
+                i += 1
+                continue
+            positionals.append(arg)
+            i += 1
+
+        if not positionals:
             print("Error: No CSV file specified.")
             print_help()
             sys.exit(1)
-        csv_path = non_flags[0]
-        pnl_column = non_flags[1] if len(non_flags) > 1 else 'net_pnl'
+        csv_path = positionals[0]
+        pnl_column = positionals[1] if len(positionals) > 1 else 'net_pnl'
         
         if not os.path.exists(csv_path):
             print(f"Error: File '{csv_path}' not found.")
@@ -75,19 +89,34 @@ def main():
             elif '-l' in sys.argv:
                 lib_idx = sys.argv.index('-l')
             
-            if lib_idx and lib_idx + 1 < len(sys.argv):
+            if lib_idx is not None and lib_idx + 1 < len(sys.argv):
                 library_path = sys.argv[lib_idx + 1]
         
+        # Parse optional crunch args
+        max_rules = 8
+        min_improvement = 8.0
+        if '--max-rules' in sys.argv:
+            idx = sys.argv.index('--max-rules')
+            if idx + 1 < len(sys.argv) and sys.argv[idx + 1].isdigit():
+                max_rules = int(sys.argv[idx + 1])
+        if '--min-improvement' in sys.argv:
+            idx = sys.argv.index('--min-improvement')
+            if idx + 1 < len(sys.argv):
+                try:
+                    min_improvement = float(sys.argv[idx + 1])
+                except ValueError:
+                    pass
+
         try:
             if use_crunch:
                 import pandas as pd
                 df = pd.read_csv(csv_path)
-                crunch_rules, filtered_df = cruncher.crunch(
+                crunch_rules, filtered_df, _, _ = cruncher.crunch(
                     df, pnl_column=pnl_column,
                     target_metric="profit_factor",
                     min_trades=300,
-                    min_improvement_pct=8.0,
-                    max_rules=8,
+                    min_improvement_pct=min_improvement,
+                    max_rules=max_rules,
                     verbose=True
                 )
                 baseline_m = cruncher._calculate_metric(df, "profit_factor", pnl_column)
@@ -177,7 +206,7 @@ def main():
             
             print(f"\n{'='*70}")
             print("Analysis complete!")
-            print(f"\nTip: Run --legacy for single-pass mode. Run --app for web UI.")
+            print(f"\nTip: --legacy for single-pass | --max-rules N | --min-improvement X | --app for web UI")
             print(f"{'='*70}\n")
 
 
@@ -199,14 +228,20 @@ ARGUMENTS:
     pnl_column      Name of the P&L column (default: 'net_pnl')
 
 OPTIONS:
-    --app, -a       Launch the interactive web application
-    --legacy, -L    Use legacy single-pass analyze (default: Dave Mabe crunch)
-    --library, -l   Analyze column library (legacy mode only)
-    --help, -h      Show this help message
+    --app, -a           Launch the interactive web application
+    --crunch            Dave Mabe iterative crunch (default)
+    --legacy, -L        Use legacy single-pass analyze
+    --max-rules N       Max rules to apply in crunch mode (default: 8)
+    --min-improvement X Min %% improvement to accept a rule (default: 8.0)
+    --library, -l       Analyze column library (legacy mode only)
+    --help, -h          Show this help message
 
 EXAMPLES:
-    # Analyze a backtest file
+    # Analyze a backtest file (Dave Mabe crunch - default)
     python -m strategy_cruncher.run real5backtest_trades_10000.csv net_pnl
+
+    # Crunch with custom rules
+    python -m strategy_cruncher.run backtest.csv net_pnl --max-rules 5 --min-improvement 10
 
     # Launch the web interface
     python -m strategy_cruncher.run --app

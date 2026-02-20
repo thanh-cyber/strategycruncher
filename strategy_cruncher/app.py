@@ -586,10 +586,18 @@ def main():
             "Min P&L Improvement %",
             min_value=0.0,
             max_value=50.0,
-            value=5.0,
+            value=8.0 if crunch_mode else 5.0,
             step=1.0,
             help="Minimum P&L improvement to consider a rule"
         )
+        
+        max_rules = st.slider(
+            "Max Rules (Crunch)",
+            min_value=1,
+            max_value=15,
+            value=8,
+            help="Maximum rules to apply in Dave Mabe crunch mode"
+        ) if crunch_mode else 8
         
         n_thresholds = st.slider(
             "Threshold Granularity",
@@ -647,14 +655,14 @@ def main():
             
             
             # Run analysis
-            with st.spinner("🔄 Crunching..." if crunch_mode else "🔄 Analyzing backtest data..."):
+            with st.spinner("Crunching..." if crunch_mode else "Analyzing backtest data..."):
                 if crunch_mode:
-                    crunch_rules, filtered_df = cruncher.crunch(
+                    crunch_rules, filtered_df, before_curve, after_curve = cruncher.crunch(
                         df, pnl_column=pnl_column,
                         target_metric="profit_factor",
                         min_trades=min_trades,
                         min_improvement_pct=min_improvement,
-                        max_rules=8,
+                        max_rules=max_rules,
                         verbose=False
                     )
                     baseline_metrics = cruncher._calculate_metrics(df, pnl_column)
@@ -683,78 +691,68 @@ def main():
             st.session_state['final_metrics'] = final_metrics
             
             if crunch_mode:
-                # Dave Mabe Crunch: Before / After
+                # Dave Mabe Crunch: Tabbed layout
                 baseline = baseline_metrics
-                st.markdown('<div class="section-title">📊 Dave Mabe Crunch - Before vs After</div>', unsafe_allow_html=True)
+                tab1, tab2, tab3, tab4 = st.tabs(["Iterative Crunch", "Rules Table", "Equity Curves", "Raw Results"])
                 
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    render_metric_card("Trades", f"{baseline['n_trades']:,} → {final_metrics['n_trades']:,}")
-                    render_metric_card("Profit Factor", f"{baseline['profit_factor']:.2f} → {final_metrics['profit_factor']:.2f}")
-                with col2:
-                    render_metric_card("Total P&L", format_currency(baseline['total_pnl']) + " → " + format_currency(final_metrics['total_pnl']), positive=final_metrics['total_pnl'] >= 0)
-                    render_metric_card("Sharpe", f"{baseline['sharpe_ratio']:.2f} → {final_metrics['sharpe_ratio']:.2f}")
-                with col3:
-                    render_metric_card("Win Rate", f"{baseline['win_rate']:.1%} → {final_metrics['win_rate']:.1%}")
-                    render_metric_card("Max DD", format_currency(baseline['max_drawdown']) + " → " + format_currency(final_metrics['max_drawdown']))
-                with col4:
-                    render_metric_card("Rules", f"{len(crunch_rules)}")
+                with tab1:
+                    st.markdown('<div class="section-title">Dave Mabe Crunch - Before vs After</div>', unsafe_allow_html=True)
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        render_metric_card("Trades", f"{baseline['n_trades']:,} → {final_metrics['n_trades']:,}")
+                        render_metric_card("Profit Factor", f"{baseline['profit_factor']:.2f} → {final_metrics['profit_factor']:.2f}")
+                    with col2:
+                        render_metric_card("Total P&L", format_currency(baseline['total_pnl']) + " → " + format_currency(final_metrics['total_pnl']), positive=final_metrics['total_pnl'] >= 0)
+                        render_metric_card("Sharpe", f"{baseline['sharpe_ratio']:.2f} → {final_metrics['sharpe_ratio']:.2f}")
+                    with col3:
+                        render_metric_card("Win Rate", f"{baseline['win_rate']:.1%} → {final_metrics['win_rate']:.1%}")
+                        render_metric_card("Max DD", format_currency(baseline['max_drawdown']) + " → " + format_currency(final_metrics['max_drawdown']))
+                    with col4:
+                        render_metric_card("Rules", f"{len(crunch_rules)}")
+                    st.markdown("#### P&L Distribution (Before / After)")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.plotly_chart(create_distribution_plot(df, pnl_column), use_container_width=True)
+                    with c2:
+                        st.plotly_chart(create_distribution_plot(filtered_df, pnl_column) if len(filtered_df) > 0 else create_distribution_plot(df, pnl_column), use_container_width=True)
                 
-                st.markdown('<div class="section-title">📈 Before / After Equity Curve</div>', unsafe_allow_html=True)
-                col1, col2 = st.columns(2)
-                with col1:
-                    fig_before = create_equity_curve(df, pnl_column, "Before (Baseline)")
-                    st.plotly_chart(fig_before, use_container_width=True)
-                with col2:
-                    fig_after = (
-                        create_equity_curve(filtered_df, pnl_column, "After (Filtered)")
-                        if len(filtered_df) > 0 else fig_before
-                    )
-                    st.plotly_chart(fig_after, use_container_width=True)
-                st.markdown("#### P&L Distribution")
-                col1, col2 = st.columns(2)
-                with col1:
-                    fig_dist_before = create_distribution_plot(df, pnl_column)
-                    st.plotly_chart(fig_dist_before, use_container_width=True)
-                with col2:
-                    fig_dist_after = (
-                        create_distribution_plot(filtered_df, pnl_column)
-                        if len(filtered_df) > 0 else fig_dist_before
-                    )
-                    st.plotly_chart(fig_dist_after, use_container_width=True)
+                with tab2:
+                    st.markdown('<div class="section-title">Rules Applied (Iterative)</div>', unsafe_allow_html=True)
+                    if crunch_rules:
+                        rules_table = pd.DataFrame(crunch_rules)
+                        display_cols = ['rule_num', 'column', 'direction', 'threshold', 'new_metric', 'improvement_pct', 'trades_remaining']
+                        st.dataframe(rules_table[[c for c in display_cols if c in rules_table.columns]], use_container_width=True, hide_index=True)
+                        col_a, col_b, col_c = st.columns(3)
+                        with col_a:
+                            csv_buf = io.StringIO()
+                            filtered_df.to_csv(csv_buf, index=False)
+                            st.download_button("Download Filtered Trades", data=csv_buf.getvalue(), file_name="crunch_filtered_trades.csv", mime="text/csv")
+                        with col_b:
+                            rules_csv = io.StringIO()
+                            rules_table.to_csv(rules_csv, index=False)
+                            st.download_button("Download Rules (CSV)", data=rules_csv.getvalue(), file_name="crunch_rules.csv", mime="text/csv")
+                        with col_c:
+                            import json
+                            def _to_json(v):
+                                if isinstance(v, (np.floating, np.integer)):
+                                    return float(v)
+                                return v
+                            rules_json = json.dumps([{k: _to_json(v) for k, v in r.items() if k in display_cols} for r in crunch_rules], indent=2)
+                            st.download_button("Download Rules (JSON)", data=rules_json, file_name="crunch_rules.json", mime="application/json")
+                    else:
+                        st.info("No rules met the criteria.")
                 
-                st.markdown('<div class="section-title">📋 Rules Applied (Iterative)</div>', unsafe_allow_html=True)
-                if crunch_rules:
-                    rules_table = pd.DataFrame(crunch_rules)
-                    display_cols = [
-                        'rule_num', 'column', 'direction', 'threshold',
-                        'new_metric', 'improvement_pct', 'trades_remaining'
-                    ]
-                    st.dataframe(
-                        rules_table[[c for c in display_cols if c in rules_table.columns]],
-                        use_container_width=True, hide_index=True
-                    )
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        csv_buf = io.StringIO()
-                        filtered_df.to_csv(csv_buf, index=False)
-                        st.download_button(
-                            "📥 Download Filtered Trades",
-                            data=csv_buf.getvalue(),
-                            file_name="crunch_filtered_trades.csv",
-                            mime="text/csv"
-                        )
-                    with col_b:
-                        rules_csv = io.StringIO()
-                        rules_table.to_csv(rules_csv, index=False)
-                        st.download_button(
-                            "📥 Download Rules",
-                            data=rules_csv.getvalue(),
-                            file_name="crunch_rules.csv",
-                            mime="text/csv"
-                        )
-                else:
-                    st.info("No rules met the criteria.")
+                with tab3:
+                    st.markdown('<div class="section-title">Before vs After Equity Curve</div>', unsafe_allow_html=True)
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.plotly_chart(create_equity_curve(df, pnl_column, "Before (Baseline)"), use_container_width=True)
+                    with col2:
+                        st.plotly_chart(create_equity_curve(filtered_df, pnl_column, "After (Filtered)") if len(filtered_df) > 0 else create_equity_curve(df, pnl_column, "After"), use_container_width=True)
+                
+                with tab4:
+                    st.markdown('<div class="section-title">Raw Data Preview</div>', unsafe_allow_html=True)
+                    st.dataframe(df.head(500), use_container_width=True, hide_index=True)
             else:
                 # Standard analyze mode
                 baseline = results.baseline_metrics
