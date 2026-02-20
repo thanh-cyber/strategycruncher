@@ -1,3 +1,10 @@
+# Dave Mabe Style Iterative Strategy Cruncher - One Rule At A Time
+#
+# Run one wide-net backtest → add column library → cruncher finds best single rule
+# → apply it → re-crunch remaining columns → repeat until no more good rules.
+#
+# Inspired by Dave Mabe's Filter Phase: iterative, one-rule-at-a-time, super explainable.
+
 """
 Strategy Cruncher - Core Optimization Engine
 
@@ -83,6 +90,18 @@ class OptimizationResult:
         return self.filtered_df
 
 
+@dataclass
+class CrunchResult:
+    """Result of Dave Mabe style iterative crunch (one rule at a time)."""
+    rules: List[Dict]  # List of applied rule dicts
+    filtered_df: pd.DataFrame
+    baseline_df: pd.DataFrame
+    baseline_metric: float
+    final_metric: float
+    target_metric: str
+    pnl_column: str
+
+
 class StrategyCruncher:
     """
     Analyzes backtest CSV data to find optimal indicator thresholds.
@@ -116,6 +135,152 @@ class StrategyCruncher:
         self.min_improvement_pct = min_improvement_pct
         self.n_threshold_bins = n_threshold_bins
         self.optimize_metric = optimize_metric
+    
+    def _calculate_metric(self, df: pd.DataFrame, metric: str, pnl_column: str) -> float:
+        """Calculate a single scalar metric for a dataframe (used by crunch)."""
+        if len(df) == 0:
+            return 0.0
+        pnl = df[pnl_column]
+        if metric == "profit_factor":
+            wins = pnl[pnl > 0].sum()
+            losses = abs(pnl[pnl < 0].sum())
+            return wins / losses if losses > 0 else (float('inf') if wins > 0 else 0.0)
+        elif metric == "expectancy":
+            return float(pnl.mean())
+        elif metric == "win_rate":
+            return float((pnl > 0).mean() * 100)
+        elif metric == "total_profit":
+            return float(pnl.sum())
+        return float(pnl.sum())
+    
+    def _detect_entry_columns(self, df: pd.DataFrame) -> List[str]:
+        """Auto-detect entry-only columns (exclude exit/MFE/MAE/UnrealizedPL, etc.)."""
+        exit_substrings = [
+            "MFE", "MAE", "UnrealizedPL", "DistToInitialStop", "BarsTo",
+            "MaxDrawdownFromMFE", "MaxFavorableExcursion", "MaxAdverseExcursion"
+        ]
+        entry_cols = []
+        for c in df.columns:
+            if not c.startswith("Col_"):
+                continue
+            if any(x in c for x in exit_substrings):
+                continue
+            if not pd.api.types.is_numeric_dtype(df[c]):
+                continue
+            if df[c].nunique() < 3 or df[c].isna().all():
+                continue
+            entry_cols.append(c)
+        return entry_cols
+    
+    def crunch(
+        self,
+        df: pd.DataFrame,
+        pnl_column: str = "net_pnl",
+        target_metric: str = "profit_factor",
+        min_trades: int = 300,
+        min_improvement_pct: float = 8.0,
+        max_rules: int = 8,
+        verbose: bool = True
+    ) -> Tuple[List[Dict], pd.DataFrame]:
+        """
+        Dave Mabe style iterative Filter Phase: one rule at a time.
+        
+        Finds best single rule → applies it → re-crunches remaining columns → repeat.
+        
+        Args:
+            df: Backtest DataFrame
+            pnl_column: P&L column name (net_pnl, profit, etc.)
+            target_metric: 'profit_factor', 'expectancy', 'win_rate', or 'total_profit'
+            min_trades: Minimum trades after each rule
+            min_improvement_pct: Minimum % improvement to accept a rule
+            max_rules: Maximum rules to apply
+            verbose: Print progress to stdout
+            
+        Returns:
+            (rules, filtered_df) - rules is list of rule dicts
+        """
+        if pnl_column not in df.columns:
+            raise ValueError(f"PnL column '{pnl_column}' not found. Available: {list(df.columns)}")
+        
+        # Auto-detect entry columns (no exit columns)
+        self.entry_columns = self._detect_entry_columns(df)
+        if not self.entry_columns:
+            # Fallback: use indicator columns (works when CSV has no Col_* columns)
+            self.entry_columns = self._detect_indicator_columns(df, pnl_column, None)
+        
+        current_df = df.copy()
+        baseline = self._calculate_metric(current_df, target_metric, pnl_column)
+        results: List[Dict] = []
+        
+        if verbose:
+            n0 = len(current_df)
+            print(f"Baseline {target_metric}: {baseline:.3f} | Trades: {n0}")
+        
+        for rule_num in range(1, max_rules + 1):
+            best_rule = None
+            best_score = -np.inf
+            
+            for col in self.entry_columns:
+                if col not in current_df.columns:
+                    continue
+                vals = current_df[col].dropna()
+                if len(vals) < 3:
+                    continue
+                thresholds = np.percentile(vals, np.arange(5, 96, 5))
+                for thresh in np.unique(thresholds):
+                    for direction in [">", "<"]:
+                        if direction == ">":
+                            mask = current_df[col] > thresh
+                        else:
+                            mask = current_df[col] < thresh
+                        filtered = current_df[mask]
+                        if len(filtered) < min_trades:
+                            continue
+                        score = self._calculate_metric(filtered, target_metric, pnl_column)
+                        # Handle inf for profit_factor
+                        if score == float('inf'):
+                            score = 999.0
+                        denom = abs(baseline) if baseline != 0 else 1e-9
+                        improvement = (score - baseline) / denom * 100
+                        if improvement >= min_improvement_pct and score > best_score:
+                            best_score = score
+                            best_rule = {
+                                "rule_num": rule_num,
+                                "column": col,
+                                "direction": direction,
+                                "threshold": round(float(thresh), 4),
+                                "new_metric": score,
+                                "improvement_pct": round(improvement, 1),
+                                "trades_remaining": len(filtered)
+                            }
+            
+            if best_rule is None:
+                if verbose:
+                    print(f"No more good rules found after {rule_num - 1} rules.")
+                break
+            
+            col = best_rule["column"]
+            thresh = best_rule["threshold"]
+            if best_rule["direction"] == ">":
+                current_df = current_df[current_df[col] > thresh]
+            else:
+                current_df = current_df[current_df[col] < thresh]
+            
+            results.append(best_rule)
+            baseline = best_rule["new_metric"]
+            
+            if verbose:
+                print(f"Rule {rule_num}: {col} {best_rule['direction']} {thresh} -> "
+                      f"{best_rule['new_metric']:.3f} (+{best_rule['improvement_pct']}%) | "
+                      f"Trades: {best_rule['trades_remaining']}")
+        
+        if verbose and results:
+            initial_metric = self._calculate_metric(df, target_metric, pnl_column)
+            final_metric = self._calculate_metric(current_df, target_metric, pnl_column)
+            pct = (final_metric - initial_metric) / (abs(initial_metric) or 1e-9) * 100
+            print(f"\nFinal: {len(results)} rules applied. {target_metric} {initial_metric:.3f} -> {final_metric:.3f} ({pct:+.1f}% edge)")
+        
+        return results, current_df
     
     def analyze(
         self,
@@ -204,7 +369,8 @@ class StrategyCruncher:
             'shares', 'entry_value', 'exit_value', 'gross_pnl', 'commission',
             'sec_taf_fee', 'slippage', 'gst', 'borrow_cost', 'net_pnl',
             'account_balance_before', 'account_balance_after', 'entry_price',
-            'exit_price', 'benchmark_price', 'Unnamed: 0', 'index',
+            'exit_price', 'entry_time', 'exit_time', 'holding_minutes',
+            'bars_held', 'trade_duration', 'benchmark_price', 'Unnamed: 0', 'index',
             # Forward-looking / PnL-derived (can't use for prediction!)
             'pct_move', 'abs_pct_move', 'win_streak', 'loss_streak', 
             'pnl_5_trade_avg', 'pnl_10_trade_avg', 'pnl_20_trade_avg',

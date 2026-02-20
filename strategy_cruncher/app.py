@@ -563,11 +563,17 @@ def main():
             help="Name of the column containing profit/loss values"
         )
         
+        crunch_mode = st.checkbox(
+            "Dave Mabe Crunch Mode (iterative, one rule at a time)",
+            value=False,
+            help="Apply rules iteratively: find best rule → apply → re-crunch until no more good rules"
+        )
+        
         min_trades = st.slider(
             "Min Trades After Filter",
             min_value=10,
             max_value=500,
-            value=50,
+            value=300 if crunch_mode else 50,
             help="Minimum trades required after applying a rule"
         )
         
@@ -634,222 +640,270 @@ def main():
                 n_threshold_bins=n_thresholds
             )
             
+            
             # Run analysis
-            with st.spinner("🔄 Analyzing backtest data..."):
-                results = cruncher.analyze(
-                    df, 
-                    pnl_column=pnl_column,
-                    analyze_column_library=analyze_library,
-                    library_path=library_path if analyze_library else 'column_library.xlsx'
-                )
+            with st.spinner("🔄 Crunching..." if crunch_mode else "🔄 Analyzing backtest data..."):
+                if crunch_mode:
+                    crunch_rules, filtered_df = cruncher.crunch(
+                        df, pnl_column=pnl_column,
+                        target_metric="profit_factor",
+                        min_trades=min_trades,
+                        min_improvement_pct=min_improvement,
+                        max_rules=8,
+                        verbose=False
+                    )
+                    baseline_metrics = cruncher._calculate_metrics(df, pnl_column)
+                    final_metrics = cruncher._calculate_metrics(filtered_df, pnl_column) if len(filtered_df) > 0 else baseline_metrics
+                    results = None
+                else:
+                    results = cruncher.analyze(
+                        df, 
+                        pnl_column=pnl_column,
+                        analyze_column_library=analyze_library,
+                        library_path=library_path if analyze_library else 'column_library.xlsx'
+                    )
+                    crunch_rules = None
+                    filtered_df = None
+                    baseline_metrics = None
+                    final_metrics = None
             
             # Store in session state
             st.session_state['results'] = results
             st.session_state['df'] = df
             st.session_state['pnl_column'] = pnl_column
+            st.session_state['crunch_mode'] = crunch_mode
+            st.session_state['crunch_rules'] = crunch_rules
+            st.session_state['filtered_df'] = filtered_df
+            st.session_state['baseline_metrics'] = baseline_metrics
+            st.session_state['final_metrics'] = final_metrics
             
-            # Baseline Metrics Section
-            st.markdown('<div class="section-title">📊 Baseline Metrics</div>', unsafe_allow_html=True)
-            
-            baseline = results.baseline_metrics
-            
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                render_metric_card("Total Trades", f"{baseline['n_trades']:,}")
-                render_metric_card("Profit Factor", f"{baseline['profit_factor']:.2f}")
-            
-            with col2:
-                pnl_positive = baseline['total_pnl'] >= 0
-                render_metric_card(
-                    "Total P&L", 
-                    format_currency(baseline['total_pnl']),
-                    positive=pnl_positive
-                )
-                render_metric_card("Sharpe Ratio", f"{baseline['sharpe_ratio']:.2f}")
-            
-            with col3:
-                render_metric_card("Win Rate", f"{baseline['win_rate']:.1%}")
-                render_metric_card("Max Drawdown", format_currency(baseline['max_drawdown']))
-            
-            with col4:
-                render_metric_card("Avg Win", format_currency(baseline['avg_win']))
-                render_metric_card("Avg Loss", format_currency(baseline['avg_loss']))
-            
-            # Equity Curve
-            st.markdown('<div class="section-title">📈 Equity Curve</div>', unsafe_allow_html=True)
-            
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                fig_equity = create_equity_curve(df, pnl_column, "Baseline Equity Curve")
-                st.plotly_chart(fig_equity, use_container_width=True)
-            
-            with col2:
-                fig_dist = create_distribution_plot(df, pnl_column)
-                st.plotly_chart(fig_dist, use_container_width=True)
-            
-            # Optimization Rules Section
-            st.markdown('<div class="section-title">🎯 Top Optimization Rules</div>', unsafe_allow_html=True)
-            
-            if not results.rules:
-                st.warning("⚠️ No optimization rules found that meet the criteria. Try lowering the minimum improvement threshold.")
-            else:
-                # Rules table
-                top_rules = results.get_top_rules(20)
+            if crunch_mode:
+                # Dave Mabe Crunch: Before / After
+                baseline = baseline_metrics
+                st.markdown('<div class="section-title">📊 Dave Mabe Crunch - Before vs After</div>', unsafe_allow_html=True)
                 
-                col1, col2 = st.columns([2, 1])
-                
+                col1, col2, col3, col4 = st.columns(4)
                 with col1:
-                    for i, rule in enumerate(top_rules[:10], 1):
-                        render_rule_card(i, rule)
-                
+                    render_metric_card("Trades", f"{baseline['n_trades']:,} → {final_metrics['n_trades']:,}")
+                    render_metric_card("Profit Factor", f"{baseline['profit_factor']:.2f} → {final_metrics['profit_factor']:.2f}")
                 with col2:
-                    # Rule effectiveness heatmap
-                    fig_heatmap = create_indicator_heatmap(top_rules)
-                    st.plotly_chart(fig_heatmap, use_container_width=True)
-                
-                # Detailed Rule Analysis
-                st.markdown('<div class="section-title">🔬 Deep Dive Analysis</div>', unsafe_allow_html=True)
-                
-                # Rule selector
-                rule_options = [f"#{i+1}: {r.column} {'>' if r.direction == 'above' else '<'} {r.threshold:.4f}" 
-                              for i, r in enumerate(top_rules)]
-                
-                selected_rule_idx = st.selectbox(
-                    "Select a rule to analyze in detail",
-                    range(len(rule_options)),
-                    format_func=lambda x: rule_options[x]
-                )
-                
-                selected_rule = top_rules[selected_rule_idx]
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    # Threshold analysis plot
-                    fig_thresh = create_threshold_analysis_plot(
-                        df, selected_rule.column, pnl_column, selected_rule.direction
-                    )
-                    if fig_thresh:
-                        st.plotly_chart(fig_thresh, use_container_width=True)
-                
-                with col2:
-                    # Apply rule and show new equity curve
-                    if selected_rule.direction == 'above':
-                        filtered_df = df[df[selected_rule.column] > selected_rule.threshold]
-                    else:
-                        filtered_df = df[df[selected_rule.column] < selected_rule.threshold]
-                    
-                    fig_filtered = create_equity_curve(
-                        filtered_df, pnl_column, 
-                        f"Equity Curve After Applying Rule"
-                    )
-                    st.plotly_chart(fig_filtered, use_container_width=True)
-                
-                # Comparison metrics
-                st.markdown("#### 📊 Before vs After Comparison")
-                
-                new_metrics = cruncher._calculate_metrics(filtered_df, pnl_column)
-                
-                comparison_data = {
-                    'Metric': ['Total Trades', 'Total P&L', 'Win Rate', 'Avg Win', 'Avg Loss', 
-                              'Profit Factor', 'Sharpe Ratio', 'Expectancy'],
-                    'Before': [
-                        f"{baseline['n_trades']:,}",
-                        format_currency(baseline['total_pnl']),
-                        f"{baseline['win_rate']:.1%}",
-                        format_currency(baseline['avg_win']),
-                        format_currency(baseline['avg_loss']),
-                        f"{baseline['profit_factor']:.2f}",
-                        f"{baseline['sharpe_ratio']:.2f}",
-                        format_currency(baseline['expectancy'])
-                    ],
-                    'After': [
-                        f"{new_metrics['n_trades']:,}",
-                        format_currency(new_metrics['total_pnl']),
-                        f"{new_metrics['win_rate']:.1%}",
-                        format_currency(new_metrics['avg_win']),
-                        format_currency(new_metrics['avg_loss']),
-                        f"{new_metrics['profit_factor']:.2f}",
-                        f"{new_metrics['sharpe_ratio']:.2f}",
-                        format_currency(new_metrics['expectancy'])
-                    ],
-                    'Change': [
-                        f"{new_metrics['n_trades'] - baseline['n_trades']:+,}",
-                        f"{((new_metrics['total_pnl'] - baseline['total_pnl']) / abs(baseline['total_pnl']) * 100) if baseline['total_pnl'] != 0 else 0:+.1f}%",
-                        f"{(new_metrics['win_rate'] - baseline['win_rate']) * 100:+.1f}pp",
-                        f"{((new_metrics['avg_win'] - baseline['avg_win']) / baseline['avg_win'] * 100) if baseline['avg_win'] != 0 else 0:+.1f}%",
-                        f"{((new_metrics['avg_loss'] - baseline['avg_loss']) / baseline['avg_loss'] * 100) if baseline['avg_loss'] != 0 else 0:+.1f}%",
-                        f"{new_metrics['profit_factor'] - baseline['profit_factor']:+.2f}",
-                        f"{new_metrics['sharpe_ratio'] - baseline['sharpe_ratio']:+.2f}",
-                        f"{((new_metrics['expectancy'] - baseline['expectancy']) / abs(baseline['expectancy']) * 100) if baseline['expectancy'] != 0 else 0:+.1f}%"
-                    ]
-                }
-                
-                st.dataframe(
-                    pd.DataFrame(comparison_data),
-                    use_container_width=True,
-                    hide_index=True
-                )
-                
-                # Download filtered data
-                st.markdown("---")
-                
-                col1, col2, col3 = st.columns([1, 1, 1])
-                
-                with col1:
-                    # Download filtered trades
-                    csv_buffer = io.StringIO()
-                    filtered_df.to_csv(csv_buffer, index=False)
-                    st.download_button(
-                        label="📥 Download Filtered Trades",
-                        data=csv_buffer.getvalue(),
-                        file_name="filtered_trades.csv",
-                        mime="text/csv"
-                    )
-                
-                with col2:
-                    # Download all rules
-                    rules_data = []
-                    for r in top_rules:
-                        rules_data.append({
-                            'Rank': top_rules.index(r) + 1,
-                            'Column': r.column,
-                            'Direction': r.direction,
-                            'Threshold': r.threshold,
-                            'Edge Score': r.edge_score,
-                            'Total PnL': r.total_pnl,
-                            'PnL Improvement %': r.pnl_improvement_pct,
-                            'Win Rate': r.win_rate,
-                            'Win Rate Change': r.win_rate_improvement,
-                            'Trades Remaining': r.trades_remaining,
-                            'Trades Filtered': r.trades_filtered,
-                            'Profit Factor': r.profit_factor,
-                            'Expectancy': r.expectancy
-                        })
-                    
-                    rules_df = pd.DataFrame(rules_data)
-                    rules_csv = io.StringIO()
-                    rules_df.to_csv(rules_csv, index=False)
-                    
-                    st.download_button(
-                        label="📥 Download All Rules",
-                        data=rules_csv.getvalue(),
-                        file_name="optimization_rules.csv",
-                        mime="text/csv"
-                    )
-                
+                    render_metric_card("Total P&L", format_currency(baseline['total_pnl']) + " → " + format_currency(final_metrics['total_pnl']), positive=final_metrics['total_pnl'] >= 0)
+                    render_metric_card("Sharpe", f"{baseline['sharpe_ratio']:.2f} → {final_metrics['sharpe_ratio']:.2f}")
                 with col3:
-                    # Generate rule code
-                    rule_code = f"""# Apply this rule to your backtest
+                    render_metric_card("Win Rate", f"{baseline['win_rate']:.1%} → {final_metrics['win_rate']:.1%}")
+                    render_metric_card("Max DD", format_currency(baseline['max_drawdown']) + " → " + format_currency(final_metrics['max_drawdown']))
+                with col4:
+                    render_metric_card("Rules", f"{len(crunch_rules)}")
+                
+                st.markdown('<div class="section-title">📈 Before / After Equity Curve</div>', unsafe_allow_html=True)
+                col1, col2 = st.columns(2)
+                with col1:
+                    fig_before = create_equity_curve(df, pnl_column, "Before (Baseline)")
+                    st.plotly_chart(fig_before, use_container_width=True)
+                with col2:
+                    fig_after = create_equity_curve(filtered_df, pnl_column, "After (Filtered)") if len(filtered_df) > 0 else fig_before
+                    st.plotly_chart(fig_after, use_container_width=True)
+                
+                st.markdown('<div class="section-title">📋 Rules Applied (Iterative)</div>', unsafe_allow_html=True)
+                if crunch_rules:
+                    rules_table = pd.DataFrame(crunch_rules)
+                    st.dataframe(rules_table[['rule_num', 'column', 'direction', 'threshold', 'new_metric', 'improvement_pct', 'trades_remaining']], use_container_width=True, hide_index=True)
+                    csv_buf = io.StringIO()
+                    filtered_df.to_csv(csv_buf, index=False)
+                    st.download_button("📥 Download Filtered Trades", data=csv_buf.getvalue(), file_name="crunch_filtered_trades.csv", mime="text/csv")
+                else:
+                    st.info("No rules met the criteria.")
+            else:
+                # Standard analyze mode
+                baseline = results.baseline_metrics
+                st.markdown('<div class="section-title">📊 Baseline Metrics</div>', unsafe_allow_html=True)
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    render_metric_card("Total Trades", f"{baseline['n_trades']:,}")
+                    render_metric_card("Profit Factor", f"{baseline['profit_factor']:.2f}")
+                with col2:
+                    pnl_positive = baseline['total_pnl'] >= 0
+                    render_metric_card("Total P&L", format_currency(baseline['total_pnl']), positive=pnl_positive)
+                    render_metric_card("Sharpe Ratio", f"{baseline['sharpe_ratio']:.2f}")
+                with col3:
+                    render_metric_card("Win Rate", f"{baseline['win_rate']:.1%}")
+                    render_metric_card("Max Drawdown", format_currency(baseline['max_drawdown']))
+                with col4:
+                    render_metric_card("Avg Win", format_currency(baseline['avg_win']))
+                    render_metric_card("Avg Loss", format_currency(baseline['avg_loss']))
+                
+                st.markdown('<div class="section-title">📈 Equity Curve</div>', unsafe_allow_html=True)
+                col1, col2 = st.columns([2, 1])
+                with col1:
+                    fig_equity = create_equity_curve(df, pnl_column, "Baseline Equity Curve")
+                    st.plotly_chart(fig_equity, use_container_width=True)
+                with col2:
+                    fig_dist = create_distribution_plot(df, pnl_column)
+                    st.plotly_chart(fig_dist, use_container_width=True)
+                
+                st.markdown('<div class="section-title">🎯 Top Optimization Rules</div>', unsafe_allow_html=True)
+            
+            if not crunch_mode:
+                if not results.rules:
+                    st.warning("⚠️ No optimization rules found that meet the criteria. Try lowering the minimum improvement threshold.")
+                else:
+                    # Rules table
+                    top_rules = results.get_top_rules(20)
+                    
+                    col1, col2 = st.columns([2, 1])
+                    
+                    with col1:
+                        for i, rule in enumerate(top_rules[:10], 1):
+                            render_rule_card(i, rule)
+                    
+                    with col2:
+                        # Rule effectiveness heatmap
+                        fig_heatmap = create_indicator_heatmap(top_rules)
+                        st.plotly_chart(fig_heatmap, use_container_width=True)
+                    
+                    # Detailed Rule Analysis
+                    st.markdown('<div class="section-title">🔬 Deep Dive Analysis</div>', unsafe_allow_html=True)
+                    
+                    # Rule selector
+                    rule_options = [f"#{i+1}: {r.column} {'>' if r.direction == 'above' else '<'} {r.threshold:.4f}" 
+                                  for i, r in enumerate(top_rules)]
+                    
+                    selected_rule_idx = st.selectbox(
+                        "Select a rule to analyze in detail",
+                        range(len(rule_options)),
+                        format_func=lambda x: rule_options[x]
+                    )
+                    
+                    selected_rule = top_rules[selected_rule_idx]
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        # Threshold analysis plot
+                        fig_thresh = create_threshold_analysis_plot(
+                            df, selected_rule.column, pnl_column, selected_rule.direction
+                        )
+                        if fig_thresh:
+                            st.plotly_chart(fig_thresh, use_container_width=True)
+                    
+                    with col2:
+                        # Apply rule and show new equity curve
+                        if selected_rule.direction == 'above':
+                            filtered_df = df[df[selected_rule.column] > selected_rule.threshold]
+                        else:
+                            filtered_df = df[df[selected_rule.column] < selected_rule.threshold]
+                        
+                        fig_filtered = create_equity_curve(
+                            filtered_df, pnl_column, 
+                            f"Equity Curve After Applying Rule"
+                        )
+                        st.plotly_chart(fig_filtered, use_container_width=True)
+                    
+                    # Comparison metrics
+                    st.markdown("#### 📊 Before vs After Comparison")
+                    
+                    new_metrics = cruncher._calculate_metrics(filtered_df, pnl_column)
+                    
+                    comparison_data = {
+                        'Metric': ['Total Trades', 'Total P&L', 'Win Rate', 'Avg Win', 'Avg Loss', 
+                                  'Profit Factor', 'Sharpe Ratio', 'Expectancy'],
+                        'Before': [
+                            f"{baseline['n_trades']:,}",
+                            format_currency(baseline['total_pnl']),
+                            f"{baseline['win_rate']:.1%}",
+                            format_currency(baseline['avg_win']),
+                            format_currency(baseline['avg_loss']),
+                            f"{baseline['profit_factor']:.2f}",
+                            f"{baseline['sharpe_ratio']:.2f}",
+                            format_currency(baseline['expectancy'])
+                        ],
+                        'After': [
+                            f"{new_metrics['n_trades']:,}",
+                            format_currency(new_metrics['total_pnl']),
+                            f"{new_metrics['win_rate']:.1%}",
+                            format_currency(new_metrics['avg_win']),
+                            format_currency(new_metrics['avg_loss']),
+                            f"{new_metrics['profit_factor']:.2f}",
+                            f"{new_metrics['sharpe_ratio']:.2f}",
+                            format_currency(new_metrics['expectancy'])
+                        ],
+                        'Change': [
+                            f"{new_metrics['n_trades'] - baseline['n_trades']:+,}",
+                            f"{((new_metrics['total_pnl'] - baseline['total_pnl']) / abs(baseline['total_pnl']) * 100) if baseline['total_pnl'] != 0 else 0:+.1f}%",
+                            f"{(new_metrics['win_rate'] - baseline['win_rate']) * 100:+.1f}pp",
+                            f"{((new_metrics['avg_win'] - baseline['avg_win']) / baseline['avg_win'] * 100) if baseline['avg_win'] != 0 else 0:+.1f}%",
+                            f"{((new_metrics['avg_loss'] - baseline['avg_loss']) / baseline['avg_loss'] * 100) if baseline['avg_loss'] != 0 else 0:+.1f}%",
+                            f"{new_metrics['profit_factor'] - baseline['profit_factor']:+.2f}",
+                            f"{new_metrics['sharpe_ratio'] - baseline['sharpe_ratio']:+.2f}",
+                            f"{((new_metrics['expectancy'] - baseline['expectancy']) / abs(baseline['expectancy']) * 100) if baseline['expectancy'] != 0 else 0:+.1f}%"
+                        ]
+                    }
+                    
+                    st.dataframe(
+                        pd.DataFrame(comparison_data),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                    
+                    # Download filtered data
+                    st.markdown("---")
+                    
+                    col1, col2, col3 = st.columns([1, 1, 1])
+                    
+                    with col1:
+                        # Download filtered trades
+                        csv_buffer = io.StringIO()
+                        filtered_df.to_csv(csv_buffer, index=False)
+                        st.download_button(
+                            label="📥 Download Filtered Trades",
+                            data=csv_buffer.getvalue(),
+                            file_name="filtered_trades.csv",
+                            mime="text/csv"
+                        )
+                    
+                    with col2:
+                        # Download all rules
+                        rules_data = []
+                        for r in top_rules:
+                            rules_data.append({
+                                'Rank': top_rules.index(r) + 1,
+                                'Column': r.column,
+                                'Direction': r.direction,
+                                'Threshold': r.threshold,
+                                'Edge Score': r.edge_score,
+                                'Total PnL': r.total_pnl,
+                                'PnL Improvement %': r.pnl_improvement_pct,
+                                'Win Rate': r.win_rate,
+                                'Win Rate Change': r.win_rate_improvement,
+                                'Trades Remaining': r.trades_remaining,
+                                'Trades Filtered': r.trades_filtered,
+                                'Profit Factor': r.profit_factor,
+                                'Expectancy': r.expectancy
+                            })
+                        
+                        rules_df = pd.DataFrame(rules_data)
+                        rules_csv = io.StringIO()
+                        rules_df.to_csv(rules_csv, index=False)
+                        
+                        st.download_button(
+                            label="📥 Download All Rules",
+                            data=rules_csv.getvalue(),
+                            file_name="optimization_rules.csv",
+                            mime="text/csv"
+                        )
+                    
+                    with col3:
+                        # Generate rule code
+                        rule_code = f"""# Apply this rule to your backtest
 # Rule: {selected_rule.column} {'>' if selected_rule.direction == 'above' else '<'} {selected_rule.threshold}
 
 df_filtered = df[df['{selected_rule.column}'] {'>' if selected_rule.direction == 'above' else '<'} {selected_rule.threshold}]
 """
-                    st.code(rule_code, language='python')
+                        st.code(rule_code, language='python')
             
-            # Column Library Recommendations Section
-            if results.column_recommendations:
+            # Column Library Recommendations Section (standard mode only)
+            if not crunch_mode and results and results.column_recommendations:
                 st.markdown('<div class="section-title">📚 Column Library Recommendations</div>', unsafe_allow_html=True)
                 
                 st.markdown("""
