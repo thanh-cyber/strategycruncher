@@ -155,25 +155,37 @@ class StrategyCruncher:
         elif metric == "total_profit":
             return float(pnl.sum())
         return float(pnl.sum())
-    
-    def _detect_entry_columns(self, df: pd.DataFrame) -> List[str]:
-        """Auto-detect entry-only columns (exclude exit/MFE/MAE/UnrealizedPL, etc.)."""
-        exit_substrings = [
+
+    def _is_usable_numeric_series(self, series: pd.Series) -> bool:
+        """Return True when a column is numeric and has enough variation."""
+        if not pd.api.types.is_numeric_dtype(series):
+            return False
+        if series.isna().all():
+            return False
+        if series.nunique() < 3:
+            return False
+        return True
+
+    def _get_entry_exclusion_terms(self) -> List[str]:
+        """Column name terms that imply forward-looking/exit-derived values."""
+        return [
             "MFE", "MAE", "UnrealizedPL", "DistToInitialStop", "BarsTo",
             "BarsToMFE", "BarsToMAE", "MaxDrawdownFromMFE",
             "MaxFavorableExcursion", "MaxAdverseExcursion",
             "Exit", "Hold", "holding_minutes", "entry_time", "exit_time",
-            "holding", "Unrealized", "Realized"
+            "holding", "Unrealized", "Realized",
         ]
+    
+    def _detect_entry_columns(self, df: pd.DataFrame) -> List[str]:
+        """Auto-detect entry-only columns (exclude exit/MFE/MAE/UnrealizedPL, etc.)."""
+        exit_substrings = self._get_entry_exclusion_terms()
         entry_cols = []
         for c in df.columns:
             if not c.startswith("Col_"):
                 continue
             if any(x.lower() in c.lower() for x in exit_substrings):
                 continue
-            if not pd.api.types.is_numeric_dtype(df[c]):
-                continue
-            if df[c].nunique() < 3 or df[c].isna().all():
+            if not self._is_usable_numeric_series(df[c]):
                 continue
             entry_cols.append(c)
         return entry_cols
@@ -500,19 +512,8 @@ class StrategyCruncher:
         for col in df.columns:
             if col in default_exclude:
                 continue
-            
-            # Check if numeric
-            if not pd.api.types.is_numeric_dtype(df[col]):
+            if not self._is_usable_numeric_series(df[col]):
                 continue
-            
-            # Check if has variation (not all same value)
-            if df[col].nunique() < 3:
-                continue
-            
-            # Check if not all NaN
-            if df[col].isna().all():
-                continue
-            
             indicator_cols.append(col)
         
         return indicator_cols

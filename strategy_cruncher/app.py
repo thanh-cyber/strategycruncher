@@ -696,17 +696,27 @@ def main():
                 tab1, tab2, tab3, tab4 = st.tabs(["Iterative Crunch", "Rules Table", "Equity Curves", "Raw Results"])
                 
                 with tab1:
-                    st.markdown('<div class="section-title">Dave Mabe Crunch - Before vs After</div>', unsafe_allow_html=True)
+                    st.markdown(
+                        '<div class="section-title">Dave Mabe Crunch - Before vs After</div>',
+                        unsafe_allow_html=True,
+                    )
                     col1, col2, col3, col4 = st.columns(4)
                     with col1:
                         render_metric_card("Trades", f"{baseline['n_trades']:,} → {final_metrics['n_trades']:,}")
                         render_metric_card("Profit Factor", f"{baseline['profit_factor']:.2f} → {final_metrics['profit_factor']:.2f}")
                     with col2:
-                        render_metric_card("Total P&L", format_currency(baseline['total_pnl']) + " → " + format_currency(final_metrics['total_pnl']), positive=final_metrics['total_pnl'] >= 0)
+                        render_metric_card(
+                            "Total P&L",
+                            format_currency(baseline['total_pnl']) + " → " + format_currency(final_metrics['total_pnl']),
+                            positive=final_metrics['total_pnl'] >= 0,
+                        )
                         render_metric_card("Sharpe", f"{baseline['sharpe_ratio']:.2f} → {final_metrics['sharpe_ratio']:.2f}")
                     with col3:
                         render_metric_card("Win Rate", f"{baseline['win_rate']:.1%} → {final_metrics['win_rate']:.1%}")
-                        render_metric_card("Max DD", format_currency(baseline['max_drawdown']) + " → " + format_currency(final_metrics['max_drawdown']))
+                        render_metric_card(
+                            "Max DD",
+                            format_currency(baseline['max_drawdown']) + " → " + format_currency(final_metrics['max_drawdown']),
+                        )
                     with col4:
                         render_metric_card("Rules", f"{len(crunch_rules)}")
                     st.markdown("#### P&L Distribution (Before / After)")
@@ -720,25 +730,55 @@ def main():
                     st.markdown('<div class="section-title">Rules Applied (Iterative)</div>', unsafe_allow_html=True)
                     if crunch_rules:
                         rules_table = pd.DataFrame(crunch_rules)
-                        display_cols = ['rule_num', 'column', 'direction', 'threshold', 'new_metric', 'improvement_pct', 'trades_remaining']
-                        st.dataframe(rules_table[[c for c in display_cols if c in rules_table.columns]], use_container_width=True, hide_index=True)
+                        display_cols = [
+                            'rule_num', 'column', 'direction', 'threshold',
+                            'new_metric', 'improvement_pct', 'trades_remaining',
+                        ]
+                        st.dataframe(
+                            rules_table[[c for c in display_cols if c in rules_table.columns]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
                         col_a, col_b, col_c = st.columns(3)
                         with col_a:
                             csv_buf = io.StringIO()
                             filtered_df.to_csv(csv_buf, index=False)
-                            st.download_button("Download Filtered Trades", data=csv_buf.getvalue(), file_name="crunch_filtered_trades.csv", mime="text/csv")
+                            st.download_button(
+                                "Download Filtered Trades",
+                                data=csv_buf.getvalue(),
+                                file_name="crunch_filtered_trades.csv",
+                                mime="text/csv",
+                            )
                         with col_b:
                             rules_csv = io.StringIO()
                             rules_table.to_csv(rules_csv, index=False)
-                            st.download_button("Download Rules (CSV)", data=rules_csv.getvalue(), file_name="crunch_rules.csv", mime="text/csv")
+                            st.download_button(
+                                "Download Rules (CSV)",
+                                data=rules_csv.getvalue(),
+                                file_name="crunch_rules.csv",
+                                mime="text/csv",
+                            )
                         with col_c:
                             import json
+
                             def _to_json(v):
                                 if isinstance(v, (np.floating, np.integer)):
                                     return float(v)
                                 return v
-                            rules_json = json.dumps([{k: _to_json(v) for k, v in r.items() if k in display_cols} for r in crunch_rules], indent=2)
-                            st.download_button("Download Rules (JSON)", data=rules_json, file_name="crunch_rules.json", mime="application/json")
+
+                            rules_json = json.dumps(
+                                [
+                                    {k: _to_json(v) for k, v in r.items() if k in display_cols}
+                                    for r in crunch_rules
+                                ],
+                                indent=2,
+                            )
+                            st.download_button(
+                                "Download Rules (JSON)",
+                                data=rules_json,
+                                file_name="crunch_rules.json",
+                                mime="application/json",
+                            )
                     else:
                         st.info("No rules met the criteria.")
                 
