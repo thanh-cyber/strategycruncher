@@ -231,6 +231,9 @@ st.markdown("""
 
 def format_currency(value: float) -> str:
     """Format a number as currency."""
+    import math
+    if math.isnan(value) or math.isinf(value):
+        return "N/A" if math.isnan(value) else ("$+∞" if value > 0 else "$-∞")
     if abs(value) >= 1_000_000:
         return f"${value/1_000_000:,.2f}M"
     elif abs(value) >= 1_000:
@@ -403,11 +406,13 @@ def create_indicator_heatmap(rules: List[RuleCandidate], top_n: int = 15) -> go.
     # Build the data matrix
     data = []
     for rule in top_rules:
+        total = rule.trades_remaining + rule.trades_filtered
+        pct_kept = (rule.trades_remaining / total * 100) if total > 0 else 0
         row = [
             rule.pnl_improvement_pct,
             rule.win_rate_improvement * 100,
             rule.edge_score * 100,  # Scale for visibility
-            (rule.trades_remaining / (rule.trades_remaining + rule.trades_filtered)) * 100
+            pct_kept
         ]
         data.append(row)
     
@@ -565,7 +570,7 @@ def main():
         
         crunch_mode = st.checkbox(
             "Dave Mabe Crunch Mode (iterative, one rule at a time)",
-            value=False,
+            value=True,
             help="Apply rules iteratively: find best rule → apply → re-crunch until no more good rules"
         )
         
@@ -701,16 +706,53 @@ def main():
                     fig_before = create_equity_curve(df, pnl_column, "Before (Baseline)")
                     st.plotly_chart(fig_before, use_container_width=True)
                 with col2:
-                    fig_after = create_equity_curve(filtered_df, pnl_column, "After (Filtered)") if len(filtered_df) > 0 else fig_before
+                    fig_after = (
+                        create_equity_curve(filtered_df, pnl_column, "After (Filtered)")
+                        if len(filtered_df) > 0 else fig_before
+                    )
                     st.plotly_chart(fig_after, use_container_width=True)
+                st.markdown("#### P&L Distribution")
+                col1, col2 = st.columns(2)
+                with col1:
+                    fig_dist_before = create_distribution_plot(df, pnl_column)
+                    st.plotly_chart(fig_dist_before, use_container_width=True)
+                with col2:
+                    fig_dist_after = (
+                        create_distribution_plot(filtered_df, pnl_column)
+                        if len(filtered_df) > 0 else fig_dist_before
+                    )
+                    st.plotly_chart(fig_dist_after, use_container_width=True)
                 
                 st.markdown('<div class="section-title">📋 Rules Applied (Iterative)</div>', unsafe_allow_html=True)
                 if crunch_rules:
                     rules_table = pd.DataFrame(crunch_rules)
-                    st.dataframe(rules_table[['rule_num', 'column', 'direction', 'threshold', 'new_metric', 'improvement_pct', 'trades_remaining']], use_container_width=True, hide_index=True)
-                    csv_buf = io.StringIO()
-                    filtered_df.to_csv(csv_buf, index=False)
-                    st.download_button("📥 Download Filtered Trades", data=csv_buf.getvalue(), file_name="crunch_filtered_trades.csv", mime="text/csv")
+                    display_cols = [
+                        'rule_num', 'column', 'direction', 'threshold',
+                        'new_metric', 'improvement_pct', 'trades_remaining'
+                    ]
+                    st.dataframe(
+                        rules_table[[c for c in display_cols if c in rules_table.columns]],
+                        use_container_width=True, hide_index=True
+                    )
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        csv_buf = io.StringIO()
+                        filtered_df.to_csv(csv_buf, index=False)
+                        st.download_button(
+                            "📥 Download Filtered Trades",
+                            data=csv_buf.getvalue(),
+                            file_name="crunch_filtered_trades.csv",
+                            mime="text/csv"
+                        )
+                    with col_b:
+                        rules_csv = io.StringIO()
+                        rules_table.to_csv(rules_csv, index=False)
+                        st.download_button(
+                            "📥 Download Rules",
+                            data=rules_csv.getvalue(),
+                            file_name="crunch_rules.csv",
+                            mime="text/csv"
+                        )
                 else:
                     st.info("No rules met the criteria.")
             else:

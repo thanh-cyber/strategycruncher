@@ -18,8 +18,8 @@ then use optimization to find the subset of trades worth taking.
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple, Literal, Callable
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from typing import List, Dict, Optional, Tuple, Literal
+import warnings
 
 
 @dataclass
@@ -258,14 +258,34 @@ class StrategyCruncher:
                 if verbose:
                     print(f"No more good rules found after {rule_num - 1} rules.")
                 break
-            
+
+            trades_before = len(current_df)
+            prev_baseline = self._calculate_metrics(current_df, pnl_column)
             col = best_rule["column"]
             thresh = best_rule["threshold"]
             if best_rule["direction"] == ">":
                 current_df = current_df[current_df[col] > thresh]
             else:
                 current_df = current_df[current_df[col] < thresh]
-            
+
+            # Enrich rule with full metrics (for analyze() conversion to RuleCandidate)
+            metrics = self._calculate_metrics(current_df, pnl_column)
+            best_rule["trades_filtered"] = trades_before - len(current_df)
+            best_rule["total_pnl"] = metrics["total_pnl"]
+            best_rule["win_rate"] = metrics["win_rate"]
+            best_rule["avg_win"] = metrics["avg_win"]
+            best_rule["avg_loss"] = metrics["avg_loss"]
+            best_rule["profit_factor"] = metrics["profit_factor"]
+            best_rule["sharpe_ratio"] = metrics["sharpe_ratio"]
+            best_rule["max_drawdown"] = metrics["max_drawdown"]
+            best_rule["expectancy"] = metrics["expectancy"]
+            best_rule["pnl_improvement"] = metrics["total_pnl"] - prev_baseline["total_pnl"]
+            denom = abs(prev_baseline["total_pnl"]) or 1e-9
+            best_rule["pnl_improvement_pct"] = best_rule["pnl_improvement"] / denom * 100
+            best_rule["win_rate_improvement"] = metrics["win_rate"] - prev_baseline["win_rate"]
+            best_rule["expectancy_improvement"] = metrics["expectancy"] - prev_baseline["expectancy"]
+            best_rule["edge_score"] = best_rule["improvement_pct"] / 100.0
+
             results.append(best_rule)
             baseline = best_rule["new_metric"]
             
@@ -281,7 +301,38 @@ class StrategyCruncher:
             print(f"\nFinal: {len(results)} rules applied. {target_metric} {initial_metric:.3f} -> {final_metric:.3f} ({pct:+.1f}% edge)")
         
         return results, current_df
-    
+
+    def _crunch_rules_to_rule_candidates(
+        self, crunch_rules: List[Dict], baseline_metrics: Dict
+    ) -> List[RuleCandidate]:
+        """Convert crunch rule dicts to RuleCandidate objects."""
+        out = []
+        for r in crunch_rules:
+            direction = "above" if r["direction"] == ">" else "below"
+            out.append(
+                RuleCandidate(
+                    column=r["column"],
+                    direction=direction,
+                    threshold=r["threshold"],
+                    trades_remaining=r["trades_remaining"],
+                    trades_filtered=r.get("trades_filtered", 0),
+                    total_pnl=r.get("total_pnl", 0),
+                    win_rate=r.get("win_rate", 0),
+                    avg_win=r.get("avg_win", 0),
+                    avg_loss=r.get("avg_loss", 0),
+                    profit_factor=r.get("profit_factor", 0),
+                    sharpe_ratio=r.get("sharpe_ratio", 0),
+                    max_drawdown=r.get("max_drawdown", 0),
+                    expectancy=r.get("expectancy", 0),
+                    pnl_improvement=r.get("pnl_improvement", 0),
+                    pnl_improvement_pct=r.get("pnl_improvement_pct", 0),
+                    win_rate_improvement=r.get("win_rate_improvement", 0),
+                    expectancy_improvement=r.get("expectancy_improvement", 0),
+                    edge_score=r.get("edge_score", r.get("improvement_pct", 0) / 100.0),
+                )
+            )
+        return out
+
     def analyze(
         self,
         data: pd.DataFrame | str,
@@ -289,10 +340,14 @@ class StrategyCruncher:
         indicator_columns: Optional[List[str]] = None,
         exclude_columns: Optional[List[str]] = None,
         analyze_column_library: bool = False,
-        library_path: str = 'column_library.xlsx'
+        library_path: str = 'column_library.xlsx',
+        iterative: bool = True,
     ) -> OptimizationResult:
         """
         Analyze backtest data to find optimal indicator thresholds.
+        
+        By default uses Dave Mabe iterative crunch (one rule at a time).
+        Set iterative=False for legacy single-pass mode (deprecated).
         
         Args:
             data: DataFrame or path to CSV file
@@ -301,6 +356,7 @@ class StrategyCruncher:
             exclude_columns: List of columns to exclude from analysis
             analyze_column_library: Whether to analyze column library for recommendations
             library_path: Path to column library Excel file
+            iterative: If True (default), use crunch() internally. If False, legacy single-pass.
             
         Returns:
             OptimizationResult with ranked rules and optional column recommendations
@@ -310,15 +366,56 @@ class StrategyCruncher:
             df = pd.read_csv(data)
         else:
             df = data.copy()
-        
+
         # Validate PnL column exists
         if pnl_column not in df.columns:
-            raise ValueError(f"PnL column '{pnl_column}' not found in data. "
-                           f"Available columns: {list(df.columns)}")
-        
-        # Auto-detect indicator columns if not specified
+            raise ValueError(
+                f"PnL column '{pnl_column}' not found. Available: {list(df.columns)}"
+            )
+
+        if iterative:
+            # Dave Mabe style: delegate to crunch(), convert to OptimizationResult
+            crunch_rules, filtered_df = self.crunch(
+                df,
+                pnl_column=pnl_column,
+                target_metric="profit_factor",
+                min_trades=self.min_trades_remaining,
+                min_improvement_pct=self.min_improvement_pct,
+                max_rules=8,
+                verbose=False,
+            )
+            baseline = self._calculate_metrics(df, pnl_column)
+            rule_candidates = self._crunch_rules_to_rule_candidates(
+                crunch_rules, baseline
+            )
+            column_recommendations = None
+            if analyze_column_library:
+                try:
+                    from .column_library_analyzer import ColumnLibraryAnalyzer
+                    analyzer = ColumnLibraryAnalyzer(library_path)
+                    column_recommendations = analyzer.analyze(
+                        df, pnl_column=pnl_column
+                    )
+                except Exception as e:
+                    warnings.warn(f"Could not analyze column library: {e}")
+            result = OptimizationResult(
+                baseline_metrics=baseline,
+                rules=rule_candidates,
+                filtered_df=filtered_df,
+                column_recommendations=column_recommendations,
+            )
+            return result
+
+        # Legacy single-pass mode (deprecated)
+        warnings.warn(
+            "analyze(iterative=False) is deprecated. Prefer crunch() or analyze(iterative=True).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if indicator_columns is None:
-            indicator_columns = self._detect_indicator_columns(df, pnl_column, exclude_columns)
+            indicator_columns = self._detect_indicator_columns(
+                df, pnl_column, exclude_columns
+            )
         
         # Calculate baseline metrics
         baseline = self._calculate_metrics(df, pnl_column)
@@ -340,7 +437,6 @@ class StrategyCruncher:
                 analyzer = ColumnLibraryAnalyzer(library_path)
                 column_recommendations = analyzer.analyze(df, pnl_column=pnl_column)
             except Exception as e:
-                import warnings
                 warnings.warn(f"Could not analyze column library: {e}")
         
         result = OptimizationResult(

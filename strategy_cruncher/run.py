@@ -37,19 +37,27 @@ def main():
     else:
         # Run command-line analysis
         from strategy_cruncher import StrategyCruncher
-        
-        csv_path = sys.argv[1]
-        pnl_column = sys.argv[2] if len(sys.argv) > 2 else 'net_pnl'
+
+        # Parse non-flag args (avoid --legacy, --library, etc. as csv/pnl)
+        non_flags = [a for a in sys.argv[1:] if not a.startswith('-')]
+        if not non_flags:
+            print("Error: No CSV file specified.")
+            print_help()
+            sys.exit(1)
+        csv_path = non_flags[0]
+        pnl_column = non_flags[1] if len(non_flags) > 1 else 'net_pnl'
         
         if not os.path.exists(csv_path):
             print(f"Error: File '{csv_path}' not found.")
             sys.exit(1)
         
-        # Dave Mabe iterative crunch mode
-        use_crunch = '--crunch' in sys.argv or '-c' in sys.argv
+        # Dave Mabe crunch is default; --legacy uses old single-pass analyze
+        use_legacy = '--legacy' in sys.argv or '-L' in sys.argv
+        use_crunch = not use_legacy
         
         print(f"\n{'='*70}")
-        print("STRATEGY CRUNCHER - Backtest Optimization Analysis" + (" [Dave Mabe Crunch]" if use_crunch else ""))
+        mode = " [Dave Mabe Crunch]" if use_crunch else " [Legacy]"
+        print("STRATEGY CRUNCHER - Backtest Optimization Analysis" + mode)
         print(f"{'='*70}")
         print(f"\nAnalyzing: {csv_path}")
         print(f"P&L Column: {pnl_column}")
@@ -101,12 +109,16 @@ def main():
                     print(f"  Edge improvement:  {pct:+.1f}%")
                 print(f"{'='*70}\n")
             else:
-                results = cruncher.analyze(
-                    csv_path, 
-                    pnl_column=pnl_column,
-                    analyze_column_library=analyze_library,
-                    library_path=library_path
-                )
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=DeprecationWarning)
+                    results = cruncher.analyze(
+                        csv_path,
+                        pnl_column=pnl_column,
+                        analyze_column_library=analyze_library,
+                        library_path=library_path,
+                        iterative=False,  # legacy single-pass
+                    )
                 baseline = results.baseline_metrics
         except Exception as e:
             print(f"\nError: {e}")
@@ -134,7 +146,7 @@ def main():
             print("=" * 70)
             
             if not results.rules:
-                print("\n⚠️  No optimization rules found that meet the criteria.")
+                print("\nWARNING: No optimization rules found that meet the criteria.")
                 print("    Try lowering the minimum improvement threshold.\n")
             else:
                 for i, rule in enumerate(results.get_top_rules(15), 1):
@@ -165,7 +177,7 @@ def main():
             
             print(f"\n{'='*70}")
             print("Analysis complete!")
-            print(f"\nTip: Run with --crunch for Dave Mabe iterative mode. Run --app for web UI.")
+            print(f"\nTip: Run --legacy for single-pass mode. Run --app for web UI.")
             print(f"{'='*70}\n")
 
 
@@ -178,7 +190,7 @@ def print_help():
 
 USAGE:
     python -m strategy_cruncher.run <backtest.csv> [pnl_column]
-    python -m strategy_cruncher.run <backtest.csv> [pnl_column] --crunch   # Dave Mabe iterative
+    python -m strategy_cruncher.run <backtest.csv> [pnl_column]   # Dave Mabe crunch (default)
     python -m strategy_cruncher.run <backtest.csv> [pnl_column] --library [library.xlsx]
     python -m strategy_cruncher.run --app
 
@@ -188,8 +200,8 @@ ARGUMENTS:
 
 OPTIONS:
     --app, -a       Launch the interactive web application
-    --crunch, -c    Dave Mabe iterative crunch (one rule at a time)
-    --library, -l   Analyze column library and recommend columns
+    --legacy, -L    Use legacy single-pass analyze (default: Dave Mabe crunch)
+    --library, -l   Analyze column library (legacy mode only)
     --help, -h      Show this help message
 
 EXAMPLES:
