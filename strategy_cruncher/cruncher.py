@@ -16,6 +16,10 @@ that maximize profit, win rate, or other metrics while filtering bad trades.
 
 Inspired by Dave Mabe's approach: cast a wide net with the initial backtest,
 then use optimization to find the subset of trades worth taking.
+
+Predictive columns: The rules returned by crunch() use the 'column' field (e.g. Entry_Col_ATR14).
+Those column names are exactly the predictive (entry) columns for your strategy—use them to
+filter or weight entries when you crunch your Excel/CSV from the backtest.
 """
 
 import pandas as pd
@@ -175,13 +179,27 @@ class StrategyCruncher:
             "Exit", "Hold", "holding_minutes", "entry_time", "exit_time",
             "holding", "Unrealized", "Realized",
         ]
-    
+
+    # Column naming convention (aligns with backtestlibrary + librarycolumn):
+    # - Entry_Col_*   = snapshot at entry time (use for ENTRY crunch only)
+    # - Col_*_Exit   = snapshot at exit time (exit crunch only; never for entry)
+    # - Cont_Col_*_* = continuous tracking (_Entry, _Exit, _Max, _Min, _At30min...); exit-side, NOT entry
+
     def _detect_entry_columns(self, df: pd.DataFrame) -> List[str]:
-        """Auto-detect entry-only columns (exclude exit/MFE/MAE/UnrealizedPL, etc.)."""
+        """
+        Auto-detect entry-only columns for entry crunch.
+        Uses ONLY: Entry_Col_* (entry snapshot) and Col_* that are not exit/forward-looking.
+        Excludes: Col_*_Exit, Cont_* (continuous), and any name with MFE/MAE/Unrealized/etc.
+        """
         exit_substrings = self._get_entry_exclusion_terms()
         entry_cols = []
         for c in df.columns:
-            if not c.startswith("Col_"):
+            # Must be entry-prefixed or bare Col_* (no continuous or exit columns)
+            if c.startswith("Cont_"):
+                continue
+            is_entry_prefixed = c.startswith("Entry_Col_")
+            is_bare_col = c.startswith("Col_") and not c.endswith("_Exit") and "_Exit" not in c
+            if not (is_entry_prefixed or is_bare_col):
                 continue
             if any(x.lower() in c.lower() for x in exit_substrings):
                 continue
@@ -216,10 +234,10 @@ class StrategyCruncher:
             
         Returns:
             (rules, filtered_df, before_curve, after_curve)
-            - rules: list of applied rule dicts
+            - rules: list of applied rule dicts; each rule['column'] is a predictive (entry) column name
             - filtered_df: trades remaining after all rules
-            - before_curve: cumulative P&L of original trades
-            - after_curve: cumulative P&L of filtered trades
+            - before_curve: cumulative P&L of original trades (chronological when time cols present)
+            - after_curve: cumulative P&L of filtered trades (chronological when time cols present)
         """
         if pnl_column not in df.columns:
             raise ValueError(f"PnL column '{pnl_column}' not found. Available: {list(df.columns)}")
@@ -233,7 +251,12 @@ class StrategyCruncher:
         current_df = df.copy()
         baseline = self._calculate_metric(current_df, target_metric, pnl_column)
         results: List[Dict] = []
-        before_curve = np.cumsum(df[pnl_column].values) if pnl_column in df.columns else np.array([])
+        # Chronological equity curve when time columns exist (e.g. backtest export)
+        sort_cols = [c for c in ["date", "entry_date", "entry_time", "EntryTime"] if c in df.columns]
+        _df_sorted = df.sort_values(sort_cols) if sort_cols else df
+        before_curve = (
+            np.cumsum(_df_sorted[pnl_column].values) if pnl_column in _df_sorted.columns else np.array([])
+        )
         
         if verbose:
             n0 = len(current_df)
@@ -321,7 +344,14 @@ class StrategyCruncher:
                 n_tr = best_rule['trades_remaining']
                 print(f"Rule {rule_num}: {col} {dir_sym} {thresh}   -> PF {pf:.2f} (+{imp:.0f}%) | Trades: {n_tr:,}")
         
-        after_curve = np.cumsum(current_df[pnl_column].values) if len(current_df) > 0 else np.array([])
+        _after_sorted = (
+            current_df.sort_values(sort_cols) if sort_cols and len(current_df) > 0 else current_df
+        )
+        after_curve = (
+            np.cumsum(_after_sorted[pnl_column].values)
+            if len(_after_sorted) > 0 and pnl_column in _after_sorted.columns
+            else np.array([])
+        )
         
         if verbose and results:
             initial_metric = self._calculate_metric(df, target_metric, pnl_column)
@@ -331,6 +361,14 @@ class StrategyCruncher:
             print("=" * 60)
         
         return results, current_df, before_curve, after_curve
+
+    @staticmethod
+    def load_trade_file(path: str) -> pd.DataFrame:
+        """Load trade data from CSV or Excel (.xlsx, .xls). Use for backtest exports."""
+        path_lower = path.lower()
+        if path_lower.endswith((".xlsx", ".xls")):
+            return pd.read_excel(path, engine="openpyxl" if path_lower.endswith(".xlsx") else None)
+        return pd.read_csv(path)
 
     def _crunch_rules_to_rule_candidates(
         self, crunch_rules: List[Dict], baseline_metrics: Dict
@@ -391,9 +429,9 @@ class StrategyCruncher:
         Returns:
             OptimizationResult with ranked rules and optional column recommendations
         """
-        # Load data
+        # Load data (CSV or Excel from backtest export)
         if isinstance(data, str):
-            df = pd.read_csv(data)
+            df = self.load_trade_file(data)
         else:
             df = data.copy()
 
@@ -487,35 +525,41 @@ class StrategyCruncher:
         pnl_column: str,
         exclude_columns: Optional[List[str]] = None
     ) -> List[str]:
-        """Auto-detect numeric columns that could be indicators."""
-        
-        # Default columns to exclude (typically not indicators or are forward-looking)
+        """
+        Fallback for entry-column detection when no Entry_Col_* / Col_* found.
+        Returns only columns safe for ENTRY crunch: excludes exit snapshots,
+        continuous columns, and forward-looking terms (MFE, MAE, Unrealized, etc.).
+        """
         default_exclude = {
-            # Trade execution details (not predictive)
             'shares', 'entry_value', 'exit_value', 'gross_pnl', 'commission',
             'sec_taf_fee', 'slippage', 'gst', 'borrow_cost', 'net_pnl',
             'account_balance_before', 'account_balance_after', 'entry_price',
             'exit_price', 'entry_time', 'exit_time', 'holding_minutes',
             'bars_held', 'trade_duration', 'benchmark_price', 'Unnamed: 0', 'index',
-            # Forward-looking / PnL-derived (can't use for prediction!)
-            'pct_move', 'abs_pct_move', 'win_streak', 'loss_streak', 
+            'pct_move', 'abs_pct_move', 'win_streak', 'loss_streak',
             'pnl_5_trade_avg', 'pnl_10_trade_avg', 'pnl_20_trade_avg',
-            'cumulative_pnl', 'running_pnl'
+            'cumulative_pnl', 'running_pnl',
         }
-        
         if exclude_columns:
             default_exclude.update(exclude_columns)
-        
         default_exclude.add(pnl_column)
-        
+
+        exit_substrings = self._get_entry_exclusion_terms()
+
         indicator_cols = []
         for col in df.columns:
             if col in default_exclude:
                 continue
+            # Do not use exit or continuous columns for entry crunch
+            if col.startswith("Cont_"):
+                continue
+            if "_Exit" in col or col.endswith("_Exit"):
+                continue
+            if any(x.lower() in col.lower() for x in exit_substrings):
+                continue
             if not self._is_usable_numeric_series(df[col]):
                 continue
             indicator_cols.append(col)
-        
         return indicator_cols
     
     def _calculate_metrics(self, df: pd.DataFrame, pnl_column: str) -> Dict:

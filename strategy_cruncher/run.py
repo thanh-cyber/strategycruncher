@@ -110,7 +110,7 @@ def main():
         try:
             if use_crunch:
                 import pandas as pd
-                df = pd.read_csv(csv_path)
+                df = StrategyCruncher.load_trade_file(csv_path)
                 crunch_rules, filtered_df, _, _ = cruncher.crunch(
                     df, pnl_column=pnl_column,
                     target_metric="profit_factor",

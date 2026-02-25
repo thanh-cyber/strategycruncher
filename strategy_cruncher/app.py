@@ -638,9 +638,13 @@ def main():
     
     # Main content
     if uploaded_file is not None:
-        # Load data
+        # Load data (CSV or Excel from backtest export)
         try:
-            df = pd.read_csv(uploaded_file)
+            fname = getattr(uploaded_file, "name", "") or ""
+            if fname.lower().endswith((".xlsx", ".xls")):
+                df = pd.read_excel(uploaded_file, engine="openpyxl" if fname.lower().endswith(".xlsx") else None)
+            else:
+                df = pd.read_csv(uploaded_file)
             
             if pnl_column not in df.columns:
                 st.error(f"❌ Column '{pnl_column}' not found in data. Available columns: {list(df.columns)}")
