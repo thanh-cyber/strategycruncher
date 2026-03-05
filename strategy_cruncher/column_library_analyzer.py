@@ -13,7 +13,7 @@ from dataclasses import dataclass
 # Support both package mode and direct script execution.
 try:
     from .cruncher import StrategyCruncher
-    from .enrichment import _extract_hour
+    from .enrichment import _extract_hour, _safe_to_datetime
 except ImportError:
     import os
     import sys
@@ -380,7 +380,7 @@ class ColumnLibraryAnalyzer:
             
             if 'day_of_week' in col_lower:
                 if 'date' in df.columns:
-                    return pd.to_datetime(df['date'], dayfirst=True, format='mixed').dt.dayofweek, "extracted from date"
+                    return _safe_to_datetime(df['date']).dt.dayofweek, "extracted from date"
         
         # Volatility-based
         if 'volatility' in category.lower() or 'atr' in col_lower:
@@ -417,9 +417,9 @@ class ColumnLibraryAnalyzer:
         top_recs = recommendations[:top_n]
         
         report_data = []
-        for rec in top_recs:
+        for i, rec in enumerate(top_recs, 1):
             report_data.append({
-                'Rank': top_recs.index(rec) + 1,
+                'Rank': i,
                 'Column Name': rec.column_name,
                 'Category': rec.category,
                 'Description': rec.description,

@@ -11,6 +11,14 @@ from typing import Optional, List
 from datetime import datetime
 
 
+def _safe_to_datetime(series, dayfirst: bool = True):
+    """Parse datetime series; use format='mixed' on pandas 2.0+, else infer."""
+    try:
+        return pd.to_datetime(series, dayfirst=dayfirst, format="mixed")
+    except (TypeError, ValueError):
+        return pd.to_datetime(series, dayfirst=dayfirst, errors="coerce")
+
+
 def enrich_backtest(
     df: pd.DataFrame,
     ticker_col: str = 'ticker',
@@ -51,7 +59,7 @@ def enrich_backtest(
         df['is_power_hour'] = df['entry_hour'].apply(lambda h: 1 if h >= 15 else 0)
     
     if date_col in df.columns:
-        df['day_of_week'] = pd.to_datetime(df[date_col], dayfirst=True, format='mixed').dt.dayofweek
+        df['day_of_week'] = _safe_to_datetime(df[date_col]).dt.dayofweek
         df['is_monday'] = (df['day_of_week'] == 0).astype(int)
         df['is_friday'] = (df['day_of_week'] == 4).astype(int)
     

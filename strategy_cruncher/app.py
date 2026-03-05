@@ -307,15 +307,17 @@ def render_rule_card(rank: int, rule: RuleCandidate):
 
 
 def create_equity_curve(df: pd.DataFrame, pnl_column: str, title: str = "Equity Curve") -> go.Figure:
-    """Create an interactive equity curve plot."""
-    cumulative_pnl = df[pnl_column].cumsum()
+    """Create an interactive equity curve plot. Sorts by date/entry_time when present so curve is chronological."""
+    sort_cols = [c for c in ["date", "entry_date", "entry_time", "EntryTime"] if c in df.columns]
+    plot_df = df.sort_values(sort_cols).reset_index(drop=True) if sort_cols else df.reset_index(drop=True)
+    cumulative_pnl = plot_df[pnl_column].cumsum()
     
     fig = go.Figure()
     
     # Main equity curve
     fig.add_trace(go.Scatter(
         x=list(range(len(cumulative_pnl))),
-        y=cumulative_pnl,
+        y=cumulative_pnl.values,
         mode='lines',
         name='Equity',
         line=dict(color='#10b981', width=2),
@@ -327,7 +329,7 @@ def create_equity_curve(df: pd.DataFrame, pnl_column: str, title: str = "Equity 
     running_max = cumulative_pnl.cummax()
     fig.add_trace(go.Scatter(
         x=list(range(len(running_max))),
-        y=running_max,
+        y=running_max.values,
         mode='lines',
         name='High Water Mark',
         line=dict(color='#3b82f6', width=1, dash='dot'),
@@ -677,7 +679,8 @@ def main():
                         df, 
                         pnl_column=pnl_column,
                         analyze_column_library=analyze_library,
-                        library_path=library_path if analyze_library else 'column_library.xlsx'
+                        library_path=library_path if analyze_library else 'column_library.xlsx',
+                        max_rules=max_rules,
                     )
                     crunch_rules = None
                     filtered_df = None
@@ -726,9 +729,9 @@ def main():
                     st.markdown("#### P&L Distribution (Before / After)")
                     c1, c2 = st.columns(2)
                     with c1:
-                        st.plotly_chart(create_distribution_plot(df, pnl_column), use_container_width=True)
+                        st.plotly_chart(create_distribution_plot(df, pnl_column), use_container_width=True, key="crunch_dist_before")
                     with c2:
-                        st.plotly_chart(create_distribution_plot(filtered_df, pnl_column) if len(filtered_df) > 0 else create_distribution_plot(df, pnl_column), use_container_width=True)
+                        st.plotly_chart(create_distribution_plot(filtered_df, pnl_column) if len(filtered_df) > 0 else create_distribution_plot(df, pnl_column), use_container_width=True, key="crunch_dist_after")
                 
                 with tab2:
                     st.markdown('<div class="section-title">Rules Applied (Iterative)</div>', unsafe_allow_html=True)
@@ -790,9 +793,9 @@ def main():
                     st.markdown('<div class="section-title">Before vs After Equity Curve</div>', unsafe_allow_html=True)
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.plotly_chart(create_equity_curve(df, pnl_column, "Before (Baseline)"), use_container_width=True)
+                        st.plotly_chart(create_equity_curve(df, pnl_column, "Before (Baseline)"), use_container_width=True, key="crunch_equity_before")
                     with col2:
-                        st.plotly_chart(create_equity_curve(filtered_df, pnl_column, "After (Filtered)") if len(filtered_df) > 0 else create_equity_curve(df, pnl_column, "After"), use_container_width=True)
+                        st.plotly_chart(create_equity_curve(filtered_df, pnl_column, "After (Filtered)") if len(filtered_df) > 0 else create_equity_curve(df, pnl_column, "After"), use_container_width=True, key="crunch_equity_after")
                 
                 with tab4:
                     st.markdown('<div class="section-title">Raw Data Preview</div>', unsafe_allow_html=True)
@@ -821,10 +824,10 @@ def main():
                 col1, col2 = st.columns([2, 1])
                 with col1:
                     fig_equity = create_equity_curve(df, pnl_column, "Baseline Equity Curve")
-                    st.plotly_chart(fig_equity, use_container_width=True)
+                    st.plotly_chart(fig_equity, use_container_width=True, key="baseline_equity")
                 with col2:
                     fig_dist = create_distribution_plot(df, pnl_column)
-                    st.plotly_chart(fig_dist, use_container_width=True)
+                    st.plotly_chart(fig_dist, use_container_width=True, key="baseline_dist")
                 
                 st.markdown('<div class="section-title">🎯 Top Optimization Rules</div>', unsafe_allow_html=True)
             
@@ -844,7 +847,7 @@ def main():
                     with col2:
                         # Rule effectiveness heatmap
                         fig_heatmap = create_indicator_heatmap(top_rules)
-                        st.plotly_chart(fig_heatmap, use_container_width=True)
+                        st.plotly_chart(fig_heatmap, use_container_width=True, key="rules_heatmap")
                     
                     # Detailed Rule Analysis
                     st.markdown('<div class="section-title">🔬 Deep Dive Analysis</div>', unsafe_allow_html=True)
@@ -869,7 +872,7 @@ def main():
                             df, selected_rule.column, pnl_column, selected_rule.direction
                         )
                         if fig_thresh:
-                            st.plotly_chart(fig_thresh, use_container_width=True)
+                            st.plotly_chart(fig_thresh, use_container_width=True, key="threshold_analysis")
                     
                     with col2:
                         # Apply rule and show new equity curve
@@ -882,7 +885,7 @@ def main():
                             filtered_df, pnl_column, 
                             f"Equity Curve After Applying Rule"
                         )
-                        st.plotly_chart(fig_filtered, use_container_width=True)
+                        st.plotly_chart(fig_filtered, use_container_width=True, key="rule_filtered_equity")
                     
                     # Comparison metrics
                     st.markdown("#### 📊 Before vs After Comparison")
@@ -949,9 +952,9 @@ def main():
                     with col2:
                         # Download all rules
                         rules_data = []
-                        for r in top_rules:
+                        for i, r in enumerate(top_rules, 1):
                             rules_data.append({
-                                'Rank': top_rules.index(r) + 1,
+                                'Rank': i,
                                 'Column': r.column,
                                 'Direction': r.direction,
                                 'Threshold': r.threshold,

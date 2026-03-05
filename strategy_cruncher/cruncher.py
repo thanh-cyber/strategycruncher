@@ -183,19 +183,19 @@ class StrategyCruncher:
     # Column naming convention (aligns with backtestlibrary + librarycolumn):
     # - Entry_Col_*   = snapshot at entry time (use for ENTRY crunch only)
     # - Col_*_Exit   = snapshot at exit time (exit crunch only; never for entry)
-    # - Cont_Col_*_* = continuous tracking (_Entry, _Exit, _Max, _Min, _At30min...); exit-side, NOT entry
+    # - Continuous_Col_* / Cont_* = continuous tracking (_Entry, _Exit, _Max, _Min, _At30min...); exit-side, NOT entry
 
     def _detect_entry_columns(self, df: pd.DataFrame) -> List[str]:
         """
         Auto-detect entry-only columns for entry crunch.
         Uses ONLY: Entry_Col_* (entry snapshot) and Col_* that are not exit/forward-looking.
-        Excludes: Col_*_Exit, Cont_* (continuous), and any name with MFE/MAE/Unrealized/etc.
+        Excludes: Col_*_Exit, Continuous_* / Cont_* (continuous), and any name with MFE/MAE/Unrealized/etc.
         """
         exit_substrings = self._get_entry_exclusion_terms()
         entry_cols = []
         for c in df.columns:
             # Must be entry-prefixed or bare Col_* (no continuous or exit columns)
-            if c.startswith("Cont_"):
+            if c.startswith("Cont_") or c.startswith("Continuous_"):
                 continue
             is_entry_prefixed = c.startswith("Entry_Col_")
             is_bare_col = c.startswith("Col_") and not c.endswith("_Exit") and "_Exit" not in c
@@ -410,6 +410,7 @@ class StrategyCruncher:
         analyze_column_library: bool = False,
         library_path: str = 'column_library.xlsx',
         iterative: bool = True,
+        max_rules: int = 8,
     ) -> OptimizationResult:
         """
         Analyze backtest data to find optimal indicator thresholds.
@@ -425,6 +426,7 @@ class StrategyCruncher:
             analyze_column_library: Whether to analyze column library for recommendations
             library_path: Path to column library Excel file
             iterative: If True (default), use crunch() internally. If False, legacy single-pass.
+            max_rules: Maximum rules to apply in iterative crunch (only when iterative=True).
             
         Returns:
             OptimizationResult with ranked rules and optional column recommendations
@@ -449,7 +451,7 @@ class StrategyCruncher:
                 target_metric="profit_factor",
                 min_trades=self.min_trades_remaining,
                 min_improvement_pct=self.min_improvement_pct,
-                max_rules=8,
+                max_rules=max_rules,
                 verbose=False,
             )
             baseline = self._calculate_metrics(df, pnl_column)
@@ -551,7 +553,7 @@ class StrategyCruncher:
             if col in default_exclude:
                 continue
             # Do not use exit or continuous columns for entry crunch
-            if col.startswith("Cont_"):
+            if col.startswith("Cont_") or col.startswith("Continuous_"):
                 continue
             if "_Exit" in col or col.endswith("_Exit"):
                 continue
