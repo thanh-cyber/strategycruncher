@@ -448,7 +448,7 @@ class StrategyCruncher:
             crunch_rules, filtered_df, _, _ = self.crunch(
                 df,
                 pnl_column=pnl_column,
-                target_metric="profit_factor",
+                target_metric=self.optimize_metric,
                 min_trades=self.min_trades_remaining,
                 min_improvement_pct=self.min_improvement_pct,
                 max_rules=max_rules,
@@ -669,7 +669,12 @@ class StrategyCruncher:
                 
                 # Calculate improvements
                 pnl_improvement = metrics['total_pnl'] - baseline['total_pnl']
-                pnl_improvement_pct = (pnl_improvement / abs(baseline['total_pnl']) * 100) if baseline['total_pnl'] != 0 else 0
+                if baseline['total_pnl'] != 0:
+                    pnl_improvement_pct = (pnl_improvement / abs(baseline['total_pnl']) * 100)
+                elif pnl_improvement > 0:
+                    pnl_improvement_pct = float('inf')
+                else:
+                    pnl_improvement_pct = 0.0
                 
                 if pnl_improvement_pct < self.min_improvement_pct:
                     continue

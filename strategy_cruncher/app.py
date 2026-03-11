@@ -451,7 +451,7 @@ def create_threshold_analysis_plot(
     column: str, 
     pnl_column: str,
     direction: str = 'above'
-) -> go.Figure:
+) -> Optional[go.Figure]:
     """Create a detailed threshold analysis plot for a specific indicator."""
     values = df[column].dropna()
     pnl_values = df.loc[values.index, pnl_column].values
