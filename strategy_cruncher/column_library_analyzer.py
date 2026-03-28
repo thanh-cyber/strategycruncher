@@ -10,19 +10,24 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
-# Support both package mode and direct script execution.
+# Support both package mode and direct script execution (second attempt must not omit symbols).
 try:
     from .cruncher import StrategyCruncher
     from .enrichment import _extract_hour, _safe_to_datetime
-except ImportError:
+except ImportError as _e_pkg:
     import os
     import sys
 
     parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if parent_dir not in sys.path:
         sys.path.insert(0, parent_dir)
-    from strategy_cruncher.cruncher import StrategyCruncher
-    from strategy_cruncher.enrichment import _extract_hour
+    try:
+        from strategy_cruncher.cruncher import StrategyCruncher
+        from strategy_cruncher.enrichment import _extract_hour, _safe_to_datetime
+    except ImportError as _e_abs:
+        raise ImportError(
+            "Could not import strategy_cruncher; install the package or run from the repo root."
+        ) from _e_abs
 
 
 @dataclass
@@ -66,146 +71,57 @@ class ColumnLibraryAnalyzer:
         self.cruncher = StrategyCruncher(min_improvement_pct=1.0, min_trades_remaining=30)
     
     def load_library(self) -> Dict[str, pd.DataFrame]:
-        """Load the column library Excel file."""
-        try:
-            xl = pd.ExcelFile(self.library_path)
-            self.library_data = {}
-            
-            for sheet_name in xl.sheet_names:
-                try:
-                    df = pd.read_excel(self.library_path, sheet_name=sheet_name)
-                    
-                    # Handle different possible column name formats
-                    if 'Column Name' in df.columns:
-                        col_col = 'Column Name'
-                    elif 'column_name' in df.columns:
-                        col_col = 'column_name'
-                    elif 'Column' in df.columns:
-                        col_col = 'Column'
-                    else:
-                        # Try first column
-                        col_col = df.columns[0] if len(df.columns) > 0 else None
-                    
-                    if not col_col:
-                        continue
-                    
-                    if 'Description' in df.columns:
-                        desc_col = 'Description'
-                    elif 'description' in df.columns:
-                        desc_col = 'description'
-                    elif 'Desc' in df.columns:
-                        desc_col = 'Desc'
-                    else:
-                        desc_col = df.columns[1] if len(df.columns) > 1 else None
-                    
-                    # Clean up the dataframe
-                    if desc_col:
-                        df_clean = df[[col_col, desc_col]].copy()
-                        df_clean.columns = ['column_name', 'description']
-                    else:
-                        df_clean = df[[col_col]].copy()
-                        df_clean.columns = ['column_name']
-                        df_clean['description'] = ''
-                    
-                    # Remove empty rows and header row if it exists
-                    df_clean = df_clean.dropna(subset=['column_name'])
-                    df_clean = df_clean[df_clean['column_name'].astype(str).str.strip() != '']
-                    # Remove if column_name is actually the header
-                    df_clean = df_clean[df_clean['column_name'].astype(str).str.lower() != 'column name']
-                    
-                    if len(df_clean) > 0:
-                        self.library_data[sheet_name] = df_clean
-                        print(f"Loaded {len(df_clean)} columns from {sheet_name}")
-                
-                except Exception as e:
-                    print(f"Warning: Could not load sheet '{sheet_name}': {e}")
-                    continue
-            
-            return self.library_data
-        
-        except Exception as e:
-            print(f"Warning: Could not load column library: {e}")
-            print("Creating default library structure...")
-            return self._create_default_library()
-    
-    def _create_default_library(self) -> Dict[str, pd.DataFrame]:
-        """Create a default column library structure based on common indicators."""
-        default_library = {
-            'Volume-Based': pd.DataFrame({
-                'column_name': [
-                    'arval', 'relative_volume', 'volume_surge', 'volume_ma_ratio',
-                    'volume_percent_of_float', 'volume_decay_rate', 'vap_density'
-                ],
-                'description': [
-                    'Average relative volume (current vs average)',
-                    'Volume relative to average',
-                    'Sudden volume spike',
-                    'Volume vs moving average',
-                    'Volume as % of float shares',
-                    'Volume decline from peak',
-                    'Volume at Price density'
-                ]
-            }),
-            'Price-Based': pd.DataFrame({
-                'column_name': [
-                    'position_in_range', 'price_percentile', 'distance_from_high',
-                    'distance_from_low', 'price_momentum', 'price_acceleration'
-                ],
-                'description': [
-                    'Position in day range (0-1)',
-                    'Price percentile in dataset',
-                    'Distance from day high',
-                    'Distance from day low',
-                    'Price momentum',
-                    'Price acceleration'
-                ]
-            }),
-            'Volatility-Based': pd.DataFrame({
-                'column_name': [
-                    'atr', 'atr_percent', 'volatility_ratio', 'bb_position',
-                    'bb_width', 'price_volatility'
-                ],
-                'description': [
-                    'Average True Range',
-                    'ATR as % of price',
-                    'Volatility vs average',
-                    'Bollinger Band position',
-                    'Bollinger Band width',
-                    'Price volatility measure'
-                ]
-            }),
-            'Momentum-Based': pd.DataFrame({
-                'column_name': [
-                    'rsi', 'macd', 'momentum', 'rate_of_change',
-                    'stochastic', 'williams_r'
-                ],
-                'description': [
-                    'Relative Strength Index',
-                    'MACD indicator',
-                    'Price momentum',
-                    'Rate of change',
-                    'Stochastic oscillator',
-                    'Williams %R'
-                ]
-            }),
-            'Time-Based': pd.DataFrame({
-                'column_name': [
-                    'entry_hour', 'minutes_since_open', 'time_of_day',
-                    'day_of_week', 'is_premarket', 'is_power_hour'
-                ],
-                'description': [
-                    'Hour of entry',
-                    'Minutes since market open',
-                    'Time of day indicator',
-                    'Day of week (0-6)',
-                    'Is pre-market trade',
-                    'Is power hour trade'
-                ]
-            })
-        }
-        
-        self.library_data = default_library
-        return default_library
+        """Load the column library Excel file. Raises on missing file, bad sheets, or empty data."""
+        xl = pd.ExcelFile(self.library_path)
+        self.library_data = {}
+
+        for sheet_name in xl.sheet_names:
+            df = pd.read_excel(self.library_path, sheet_name=sheet_name)
+
+            if 'Column Name' in df.columns:
+                col_col = 'Column Name'
+            elif 'column_name' in df.columns:
+                col_col = 'column_name'
+            elif 'Column' in df.columns:
+                col_col = 'Column'
+            elif len(df.columns) > 0:
+                col_col = df.columns[0]
+            else:
+                raise ValueError(
+                    f"Sheet {sheet_name!r} in {self.library_path!r} has no columns."
+                )
+
+            if 'Description' in df.columns:
+                desc_col = 'Description'
+            elif 'description' in df.columns:
+                desc_col = 'description'
+            elif 'Desc' in df.columns:
+                desc_col = 'Desc'
+            else:
+                desc_col = df.columns[1] if len(df.columns) > 1 else None
+
+            if desc_col:
+                df_clean = df[[col_col, desc_col]].copy()
+                df_clean.columns = ['column_name', 'description']
+            else:
+                df_clean = df[[col_col]].copy()
+                df_clean.columns = ['column_name']
+                df_clean['description'] = ''
+
+            df_clean = df_clean.dropna(subset=['column_name'])
+            df_clean = df_clean[df_clean['column_name'].astype(str).str.strip() != '']
+            df_clean = df_clean[df_clean['column_name'].astype(str).str.lower() != 'column name']
+
+            if len(df_clean) == 0:
+                raise ValueError(
+                    f"Sheet {sheet_name!r} in {self.library_path!r} has no valid column rows after cleaning."
+                )
+
+            self.library_data[sheet_name] = df_clean
+
+        if not self.library_data:
+            raise ValueError(f"No sheets found in {self.library_path!r}")
+        return self.library_data
     
     def analyze(
         self,
@@ -226,10 +142,16 @@ class ColumnLibraryAnalyzer:
         """
         if not self.library_data:
             self.load_library()
-        
+
+        if pnl_column not in backtest_df.columns:
+            raise ValueError(
+                f"Column library analyze: PnL column {pnl_column!r} not found "
+                f"(columns: {list(backtest_df.columns)})"
+            )
+
         recommendations = []
-        
-        # Get baseline metrics
+
+        # Get baseline metrics (raises on NaN / non-numeric PnL like cruncher)
         baseline = self.cruncher._calculate_metrics(backtest_df, pnl_column)
         
         # Analyze each category

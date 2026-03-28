@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "strategycruncher"
 version = "1.0.0"
-description = "Backtest optimization and rule discovery tool for trading strategies"
+description = "FireEye — backtest optimization and rule discovery for trading strategies"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "thanh-cyber" }]
@@ -15,6 +15,7 @@ dependencies = [
     "numpy>=1.24",
     "streamlit>=1.28.0",
     "plotly>=5.15.0",
+    "openpyxl>=3.1.0",
 ]
 keywords = ["trading", "backtesting", "optimization", "quant", "streamlit"]
 classifiers = [
@@ -27,10 +28,21 @@ classifiers = [
 
 [project.scripts]
 strategy-cruncher = "strategy_cruncher.run:main"
+fireeye = "strategy_cruncher.run:main"
 
 [tool.setuptools]
 packages = ["strategy_cruncher"]
 
+[tool.setuptools.package-data]
+strategy_cruncher = ["assets/*.png"]
+
 [project.urls]
 Homepage = "https://github.com/thanh-cyber/strategycruncher"
 Repository = "https://github.com/thanh-cyber/strategycruncher"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

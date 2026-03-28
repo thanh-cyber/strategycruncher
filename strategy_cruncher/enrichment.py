@@ -2,7 +2,7 @@
 Indicator Enrichment Utilities
 
 Add commonly predictive indicators to your backtest data
-to give the Strategy Cruncher more columns to analyze.
+to give FireEye more columns to analyze.
 """
 
 import pandas as pd
@@ -12,11 +12,8 @@ from datetime import datetime
 
 
 def _safe_to_datetime(series, dayfirst: bool = True):
-    """Parse datetime series; use format='mixed' on pandas 2.0+, else infer."""
-    try:
-        return pd.to_datetime(series, dayfirst=dayfirst, format="mixed")
-    except (TypeError, ValueError):
-        return pd.to_datetime(series, dayfirst=dayfirst, errors="coerce")
+    """Parse datetime series (format='mixed' requires pandas 2.x)."""
+    return pd.to_datetime(series, dayfirst=dayfirst, format="mixed")
 
 
 def enrich_backtest(
@@ -107,7 +104,7 @@ def _extract_hour(time_str) -> float:
     """Extract hour as a decimal from time string."""
     try:
         if pd.isna(time_str):
-            return 12.0
+            raise ValueError("entry_time is missing (NaN); cannot derive entry_hour")
 
         # Numeric values are interpreted as already-decimal hours.
         if isinstance(time_str, (int, float, np.integer, np.floating)):
@@ -123,9 +120,11 @@ def _extract_hour(time_str) -> float:
                 hour = int(parts[0])
                 minute = int(parts[1]) if len(parts) > 1 else 0
                 return hour + minute / 60
-        return 12.0  # Default to midday if parsing fails
-    except Exception:
-        return 12.0
+        raise ValueError(f"Unrecognized time value: {time_str!r}") from None
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Could not parse time value: {time_str!r}") from e
 
 
 def _calculate_streak(condition: pd.Series) -> pd.Series:
@@ -155,32 +154,61 @@ def add_market_context(
     """
     if spy_data is None:
         return df
-    
+
+    if date_col not in df.columns:
+        raise ValueError(
+            f"add_market_context: date column {date_col!r} not in dataframe "
+            f"(columns: {list(df.columns)})"
+        )
+    if "date" not in spy_data.columns:
+        raise ValueError(
+            "add_market_context: spy_data must include a 'date' column "
+            f"(columns: {list(spy_data.columns)})"
+        )
+
     df = df.copy()
-    
-    # Merge SPY data
     spy_data = spy_data.copy()
-    spy_data['date'] = pd.to_datetime(spy_data['date']).dt.date
-    df['_date'] = pd.to_datetime(df[date_col]).dt.date
-    
+
+    # Calendar date keys only for join (never overwrite the trade sheet's date column).
+    spy_data["_spy_join_date"] = pd.to_datetime(spy_data["date"]).dt.date
+    df["_trade_join_date"] = pd.to_datetime(df[date_col]).dt.date
+
     # Calculate SPY metrics
-    if 'close' in spy_data.columns and 'open' in spy_data.columns:
-        spy_data['spy_gap'] = (spy_data['open'] - spy_data['close'].shift(1)) / spy_data['close'].shift(1) * 100
-        spy_data['spy_day_move'] = (spy_data['close'] - spy_data['open']) / spy_data['open'] * 100
-        spy_data['spy_range'] = (spy_data['high'] - spy_data['low']) / spy_data['open'] * 100
-        
-        # Trend indicators
-        spy_data['spy_above_20ma'] = (spy_data['close'] > spy_data['close'].rolling(20).mean()).astype(int)
-        spy_data['spy_above_50ma'] = (spy_data['close'] > spy_data['close'].rolling(50).mean()).astype(int)
-    
-    if 'volume' in spy_data.columns:
-        spy_data['spy_volume_vs_avg'] = spy_data['volume'] / spy_data['volume'].rolling(20).mean()
-    
-    # Merge
-    merge_cols = ['date'] + [col for col in spy_data.columns if col.startswith('spy_')]
-    df = df.merge(spy_data[merge_cols], left_on='_date', right_on='date', how='left', suffixes=('', '_spy'))
-    df = df.drop(columns=['_date', 'date_spy'], errors='ignore')
-    
+    if "close" in spy_data.columns and "open" in spy_data.columns:
+        spy_data["spy_gap"] = (
+            (spy_data["open"] - spy_data["close"].shift(1))
+            / spy_data["close"].shift(1)
+            * 100
+        )
+        spy_data["spy_day_move"] = (
+            (spy_data["close"] - spy_data["open"]) / spy_data["open"] * 100
+        )
+        spy_data["spy_range"] = (
+            (spy_data["high"] - spy_data["low"]) / spy_data["open"] * 100
+        )
+
+        spy_data["spy_above_20ma"] = (
+            spy_data["close"] > spy_data["close"].rolling(20).mean()
+        ).astype(int)
+        spy_data["spy_above_50ma"] = (
+            spy_data["close"] > spy_data["close"].rolling(50).mean()
+        ).astype(int)
+
+    if "volume" in spy_data.columns:
+        spy_data["spy_volume_vs_avg"] = (
+            spy_data["volume"] / spy_data["volume"].rolling(20).mean()
+        )
+
+    spy_cols = [c for c in spy_data.columns if c.startswith("spy_")]
+    merge_subset = spy_data[["_spy_join_date"] + spy_cols]
+    df = df.merge(
+        merge_subset,
+        left_on="_trade_join_date",
+        right_on="_spy_join_date",
+        how="left",
+    )
+    df = df.drop(columns=["_trade_join_date", "_spy_join_date"], errors="ignore")
+
     return df
 
 

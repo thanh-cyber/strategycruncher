@@ -1,7 +1,7 @@
-# Strategy Cruncher - Requirements
+# FireEye (strategy_cruncher) - Requirements
 # Install with: pip install -r strategy_cruncher/requirements.txt
 
-pandas>=1.5.0
+pandas>=2.0,<3
 numpy>=1.21.0
 streamlit>=1.28.0
 plotly>=5.15.0

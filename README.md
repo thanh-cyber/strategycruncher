@@ -1,8 +1,8 @@
-# strategycruncher
+# FireEye (`strategycruncher`)
 
-Backtest optimization and rule discovery library for systematic trading workflows.
+**FireEye** is the product name for this repo’s backtest optimization and rule-discovery tool. The Python package remains `strategy_cruncher` for imports.
 
-It scans numeric backtest columns, tests threshold filters, and ranks rules by edge score.
+It scans numeric backtest columns, tests threshold filters, and ranks rules by mean $/trade spread (Dave Mabe–style report metrics).
 
 ## Install
 
@@ -38,6 +38,12 @@ for rule in results.get_top_rules(10):
 ```
 
 ## Launch Web App
+
+```bash
+fireeye --app
+```
+
+or:
 
 ```bash
 strategy-cruncher --app

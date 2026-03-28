@@ -1,5 +1,5 @@
 """
-Test script for Strategy Cruncher
+Test script for FireEye (strategy_cruncher package)
 """
 import sys
 import os
@@ -35,7 +35,7 @@ def _get_test_df():
 
 def run_tests():
     print("=" * 60)
-    print("STRATEGY CRUNCHER - Test Suite")
+    print("FIREEYE - Test Suite")
     print("=" * 60)
 
     # Test 1: Import all modules
@@ -88,9 +88,9 @@ def run_tests():
     try:
         if results.rules:
             top_rule = results.get_top_rules(1)[0]
-            dir_symbol = '>' if top_rule.direction == 'above' else '<'
+            dir_symbol = '>=' if top_rule.direction == 'above' else '<'
             print(f"  Top rule: {top_rule.column} {dir_symbol} {top_rule.threshold:.2f}")
-            print(f"  Edge score: {top_rule.edge_score:.2f}")
+            print(f"  Mean $/trade spread: {top_rule.mean_profit_spread:.2f}")
             print(f"  PnL improvement: {top_rule.pnl_improvement_pct:+.1f}%")
             print("  [OK] PASS: Rule access works")
         else:
@@ -110,6 +110,11 @@ def run_tests():
         assert 'sharpe_ratio' in baseline
         assert 'max_drawdown' in baseline
         assert 'expectancy' in baseline
+        assert 'calmar_ratio' in baseline
+        if results.rules:
+            tr0 = results.rules[0]
+            assert hasattr(tr0, 'mean_profit_spread')
+            assert hasattr(tr0, 'curve_quality_improvement')
         print("  [OK] PASS: All metrics present")
     except Exception as e:
         print(f"  [X] FAIL: {e}")

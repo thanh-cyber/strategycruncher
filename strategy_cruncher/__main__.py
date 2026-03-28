@@ -1,5 +1,5 @@
 """
-Allow running the Strategy Cruncher as a module:
+Allow running FireEye as a module:
     python -m strategy_cruncher [args]
 """
 from .run import main

@@ -1,7 +1,7 @@
 """
-Strategy Cruncher - Quick Start Script
+FireEye — Quick Start Script
 
-Run the Strategy Cruncher from the command line:
+Run FireEye from the command line:
     python -m strategy_cruncher.run backtest.csv [pnl_column]
 
 Or launch the web app:
@@ -29,7 +29,8 @@ def main():
         # Launch Streamlit app
         import subprocess
         app_path = os.path.join(os.path.dirname(__file__), 'app.py')
-        subprocess.run(['streamlit', 'run', app_path])
+        completed = subprocess.run(["streamlit", "run", app_path])
+        raise SystemExit(completed.returncode)
     
     elif sys.argv[1] == '--help' or sys.argv[1] == '-h':
         print_help()
@@ -71,7 +72,7 @@ def main():
         
         print(f"\n{'='*70}")
         mode = " [Dave Mabe Crunch]" if use_crunch else " [Legacy]"
-        print("STRATEGY CRUNCHER - Backtest Optimization Analysis" + mode)
+        print("FIREEYE - Backtest Optimization Analysis" + mode)
         print(f"{'='*70}")
         print(f"\nAnalyzing: {csv_path}")
         print(f"P&L Column: {pnl_column}")
@@ -97,64 +98,69 @@ def main():
         min_improvement = 8.0
         if '--max-rules' in sys.argv:
             idx = sys.argv.index('--max-rules')
-            if idx + 1 < len(sys.argv) and sys.argv[idx + 1].isdigit():
-                max_rules = int(sys.argv[idx + 1])
+            if idx + 1 >= len(sys.argv):
+                print("Error: --max-rules requires a positive integer.", file=sys.stderr)
+                sys.exit(1)
+            arg = sys.argv[idx + 1]
+            if not arg.isdigit() or int(arg) < 1:
+                print(
+                    f"Error: invalid --max-rules value {arg!r} (expected a positive integer).",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            max_rules = int(arg)
         if '--min-improvement' in sys.argv:
             idx = sys.argv.index('--min-improvement')
-            if idx + 1 < len(sys.argv):
-                try:
-                    min_improvement = float(sys.argv[idx + 1])
-                except ValueError:
-                    pass
-
-        try:
-            if use_crunch:
-                import pandas as pd
-                df = StrategyCruncher.load_trade_file(csv_path)
-                crunch_rules, filtered_df, _, _ = cruncher.crunch(
-                    df, pnl_column=pnl_column,
-                    target_metric="profit_factor",
-                    min_trades=300,
-                    min_improvement_pct=min_improvement,
-                    max_rules=max_rules,
-                    verbose=True
+            if idx + 1 >= len(sys.argv):
+                print("Error: --min-improvement requires a numeric value.", file=sys.stderr)
+                sys.exit(1)
+            try:
+                min_improvement = float(sys.argv[idx + 1])
+            except ValueError:
+                print(
+                    f"Error: invalid --min-improvement value {sys.argv[idx + 1]!r} (expected a number).",
+                    file=sys.stderr,
                 )
-                baseline_m = cruncher._calculate_metric(df, "profit_factor", pnl_column)
-                final_m = cruncher._calculate_metric(filtered_df, "profit_factor", pnl_column) if len(filtered_df) > 0 else 0
-                print(f"\n{'='*70}")
-                print("RULES APPLIED (Dave Mabe Iterative)")
-                print("=" * 70)
-                for r in crunch_rules:
-                    print(f"  {r['rule_num']}. {r['column']} {r['direction']} {r['threshold']} -> "
-                          f"PF {r['new_metric']:.3f} (+{r['improvement_pct']}%) | Trades: {r['trades_remaining']}")
-                print(f"\n{'='*70}")
-                print(f"FINAL SUMMARY")
-                print("-" * 40)
-                print(f"  Rules applied:     {len(crunch_rules)}")
-                print(f"  Trades:            {len(df):,} -> {len(filtered_df):,}")
-                print(f"  Profit Factor:     {baseline_m:.3f} -> {final_m:.3f}")
-                if baseline_m and baseline_m != float('inf'):
-                    pct = (final_m - baseline_m) / abs(baseline_m) * 100
-                    print(f"  Edge improvement:  {pct:+.1f}%")
-                print(f"{'='*70}\n")
-            else:
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=DeprecationWarning)
-                    results = cruncher.analyze(
-                        csv_path,
-                        pnl_column=pnl_column,
-                        analyze_column_library=analyze_library,
-                        library_path=library_path,
-                        iterative=False,  # legacy single-pass
-                    )
-                baseline = results.baseline_metrics
-        except Exception as e:
-            print(f"\nError: {e}")
-            import traceback
-            traceback.print_exc()
-            sys.exit(1)
-        
+                sys.exit(1)
+
+        if use_crunch:
+            import pandas as pd
+            df = StrategyCruncher.load_trade_file(csv_path)
+            crunch_rules, filtered_df, _, _ = cruncher.crunch(
+                df, pnl_column=pnl_column,
+                target_metric="profit_factor",
+                min_trades=300,
+                min_improvement_pct=min_improvement,
+                max_rules=max_rules,
+                verbose=True
+            )
+            baseline_m = cruncher._calculate_metric(df, "profit_factor", pnl_column)
+            final_m = cruncher._calculate_metric(filtered_df, "profit_factor", pnl_column) if len(filtered_df) > 0 else 0
+            print(f"\n{'='*70}")
+            print("RULES APPLIED (Dave Mabe Iterative)")
+            print("=" * 70)
+            for r in crunch_rules:
+                print(f"  {r['rule_num']}. {r['column']} {r['direction']} {r['threshold']} -> "
+                      f"PF {r['new_metric']:.3f} (+{r['improvement_pct']}%) | Trades: {r['trades_remaining']}")
+            print(f"\n{'='*70}")
+            print(f"FINAL SUMMARY")
+            print("-" * 40)
+            print(f"  Rules applied:     {len(crunch_rules)}")
+            print(f"  Trades:            {len(df):,} -> {len(filtered_df):,}")
+            print(f"  Profit Factor:     {baseline_m:.3f} -> {final_m:.3f}")
+            if baseline_m and baseline_m != float('inf'):
+                pct = (final_m - baseline_m) / abs(baseline_m) * 100
+                print(f"  Edge improvement:  {pct:+.1f}%")
+            print(f"{'='*70}\n")
+        else:
+            results = cruncher.analyze(
+                csv_path,
+                pnl_column=pnl_column,
+                analyze_column_library=analyze_library,
+                library_path=library_path,
+                iterative=False,  # legacy single-pass
+            )
+
         if not use_crunch:
             baseline = results.baseline_metrics
             print(f"\n{'='*70}")
@@ -171,7 +177,7 @@ def main():
             print(f"  Expectancy:      ${baseline['expectancy']:.2f}/trade")
             
             print(f"\n\n{'='*70}")
-            print("TOP 15 OPTIMIZATION RULES (Ranked by Edge Score)")
+            print("TOP 15 OPTIMIZATION RULES (Ranked by mean $/trade spread)")
             print("=" * 70)
             
             if not results.rules:
@@ -179,9 +185,9 @@ def main():
                 print("    Try lowering the minimum improvement threshold.\n")
             else:
                 for i, rule in enumerate(results.get_top_rules(15), 1):
-                    dir_symbol = '>' if rule.direction == 'above' else '<'
+                    dir_symbol = '>=' if rule.direction == 'above' else '<'
                     print(f"\n#{i}. {rule.column} {dir_symbol} {rule.threshold:.4f}")
-                    print(f"    Edge Score:      {rule.edge_score:.3f}")
+                    print(f"    Mean $ spread:   {rule.mean_profit_spread:.4f}")
                     print(f"    Trades Kept:     {rule.trades_remaining:,} ({rule.trades_remaining/baseline['n_trades']:.1%} of original)")
                     print(f"    Total P&L:       ${rule.total_pnl:,.2f} ({rule.pnl_improvement_pct:+.1f}%)")
                     print(f"    Win Rate:        {rule.win_rate:.1%} ({rule.win_rate_improvement:+.1%})")
@@ -213,7 +219,7 @@ def main():
 def print_help():
     help_text = """
 ======================================================================
-                       STRATEGY CRUNCHER                              
+                           FIREEYE                                  
             Backtest Optimization & Rule Discovery Tool               
 ======================================================================
 
@@ -250,13 +256,13 @@ EXAMPLES:
     streamlit run strategy_cruncher/app.py
 
 WHAT IT DOES:
-    The Strategy Cruncher analyzes your backtest data to find optimal
+    FireEye analyzes your backtest data to find optimal
     indicator thresholds that filter out bad trades. It:
     
     1. Scans all numeric columns as potential indicators
     2. Tests thousands of threshold values
     3. Finds the optimal cutoff for each indicator
-    4. Ranks rules by their "edge score" (improvement vs. trade retention)
+    4. Ranks rules by mean $/trade spread between better and worse trade sets (Dave Mabe–style report)
     5. Shows you exactly which rules will improve your strategy
 
 EXPECTED CSV FORMAT:

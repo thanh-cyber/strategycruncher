@@ -1,4 +1,4 @@
-# Strategy Cruncher - Backtest Optimization Tool
+# FireEye — Backtest Optimization Tool (package: strategy_cruncher)
 # Dave Mabe style iterative Filter Phase - one rule at a time
 
 from .cruncher import StrategyCruncher, OptimizationResult, RuleCandidate, CrunchResult

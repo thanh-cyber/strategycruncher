@@ -1,5 +1,5 @@
 # =====================================================
-# Dave Mabe Style Iterative Strategy Cruncher
+# Dave Mabe Style Iterative Filter Phase (FireEye)
 # One wide-net backtest -> Smart Filter Phase
 # =====================================================
 #
@@ -9,7 +9,7 @@
 # Inspired by Dave Mabe's Filter Phase: iterative, one-rule-at-a-time, super explainable.
 
 """
-Strategy Cruncher - Core Optimization Engine
+FireEye — Core Optimization Engine
 
 Analyzes backtest trade data to find optimal indicator thresholds
 that maximize profit, win rate, or other metrics while filtering bad trades.
@@ -18,6 +18,11 @@ Inspired by Dave Mabe's approach: cast a wide net with the initial backtest,
 then use optimization to find the subset of trades worth taking.
 
 Predictive columns: The rules returned by crunch() use the 'column' field (e.g. Entry_Col_ATR14).
+Naming matches backtestlibrary (see columns.py): Entry_Col_* = entry bar snapshot, Exit_Col_* = exit
+bar snapshot, Continuous_Col_*_* = intra-trade tracking (suffixes _Entry, _Exit, _Max, _Min, _At30min, _At60min).
+
+Calmar-style ratio (aligned with common trading reports): total P&L divided by maximum drawdown
+on the cumulative equity curve (higher is better when drawdown is positive).
 Those column names are exactly the predictive (entry) columns for your strategy—use them to
 filter or weight entries when you crunch your Excel/CSV from the backtest.
 """
@@ -26,7 +31,65 @@ import pandas as pd
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Literal
-import warnings
+
+
+def calmar_ratio(total_pnl: float, max_drawdown: float) -> float:
+    """Total P&L divided by max equity drawdown (Dave Mabe-style Calmar column)."""
+    if max_drawdown is None or max_drawdown <= 1e-12:
+        return float("inf") if total_pnl > 0 else 0.0
+    return float(total_pnl / max_drawdown)
+
+
+def _report_sort_columns(df: pd.DataFrame) -> List[str]:
+    """Chronological order for equity-style metrics (matches report dual curves)."""
+    return [c for c in ("date", "entry_date", "entry_time", "EntryTime") if c in df.columns]
+
+
+def equity_curve_quality(cumulative: np.ndarray) -> float:
+    """
+    Correlation of cumulative P&L with trade index (ideal smooth uptrend ≈ 1).
+    Per Dave Mabe report docs: relates equity path to a 45° rising line in (index, equity) space;
+    can range from -1 to 1; improvement compares better vs worse trade-set curves.
+    """
+    n = len(cumulative)
+    if n < 2:
+        return 0.0
+    x = np.arange(n, dtype=float)
+    sy = float(np.std(cumulative))
+    if sy < 1e-15:
+        return 0.0
+    r = np.corrcoef(x, cumulative.astype(float))[0, 1]
+    return float(r) if np.isfinite(r) else 0.0
+
+
+def curve_quality_metrics_for_rule(
+    df: pd.DataFrame,
+    pnl_column: str,
+    column: str,
+    direction: Literal["above", "below"],
+    threshold: float,
+) -> Tuple[float, float, float]:
+    """
+    (quality_better, quality_worse, quality_improvement) using green/red cumulative paths
+    on time-sorted trades — see https://app.davemabe.com/docs/report-metrics
+    """
+    sort_cols = _report_sort_columns(df)
+    plot_df = (
+        df.sort_values(sort_cols).reset_index(drop=True)
+        if sort_cols
+        else df.reset_index(drop=True)
+    )
+    pnl = plot_df[pnl_column].astype(float).values
+    col = plot_df[column]
+    if direction == "above":
+        passes = (col >= threshold).fillna(False).values
+    else:
+        passes = (col < threshold).fillna(False).values
+    cum_better = np.cumsum(np.where(passes, pnl, 0.0))
+    cum_worse = np.cumsum(np.where(~passes, pnl, 0.0))
+    qb = equity_curve_quality(cum_better)
+    qw = equity_curve_quality(cum_worse)
+    return qb, qw, qb - qw
 
 
 @dataclass
@@ -54,16 +117,22 @@ class RuleCandidate:
     win_rate_improvement: float
     expectancy_improvement: float
     
-    # Statistical significance
-    edge_score: float  # Composite score ranking this rule's power
+    # Dave Mabe report metrics (https://app.davemabe.com/docs/report-metrics)
+    mean_profit_spread: float  # mean P&L | better − mean P&L | worse (optimization target for Value)
+    curve_quality_better: float  # correlation of green cumulative curve with rising trend
+    curve_quality_worse: float  # same for red curve
+    curve_quality_improvement: float  # curve_quality_better − curve_quality_worse (max 2.0)
+    
+    # Ranking (legacy name: defaults to scale comparable to mean spread in single-pass mode)
+    edge_score: float
     
     def __repr__(self):
-        dir_symbol = '>' if self.direction == 'above' else '<'
+        dir_symbol = '>=' if self.direction == 'above' else '<'
         return (f"Rule: {self.column} {dir_symbol} {self.threshold:.4f} | "
                 f"PnL: ${self.total_pnl:,.2f} ({self.pnl_improvement_pct:+.1f}%) | "
                 f"Win Rate: {self.win_rate:.1%} | "
                 f"Trades: {self.trades_remaining} | "
-                f"Edge Score: {self.edge_score:.2f}")
+                f"Mean spread: {self.mean_profit_spread:.4f}")
 
 
 @dataclass
@@ -75,8 +144,8 @@ class OptimizationResult:
     filtered_df: Optional[pd.DataFrame] = None
     column_recommendations: Optional[List] = None  # ColumnRecommendation objects
     
-    def get_top_rules(self, n: int = 10, metric: str = 'edge_score') -> List[RuleCandidate]:
-        """Get top N rules ranked by specified metric."""
+    def get_top_rules(self, n: int = 10, metric: str = 'mean_profit_spread') -> List[RuleCandidate]:
+        """Get top N rules ranked by specified metric (default: mean $/trade spread, Dave Mabe report style)."""
         return sorted(self.rules, key=lambda r: getattr(r, metric), reverse=True)[:n]
     
     def get_top_column_recommendations(self, n: int = 20) -> List:
@@ -87,10 +156,11 @@ class OptimizationResult:
     
     def apply_rule(self, rule: RuleCandidate, df: pd.DataFrame) -> pd.DataFrame:
         """Apply a rule and return filtered dataframe."""
+        col = df[rule.column]
         if rule.direction == 'above':
-            mask = df[rule.column] > rule.threshold
+            mask = col.ge(rule.threshold).fillna(False)
         else:
-            mask = df[rule.column] < rule.threshold
+            mask = col.lt(rule.threshold).fillna(False)
         
         self.applied_rules.append(rule)
         self.filtered_df = df[mask].copy()
@@ -127,10 +197,12 @@ class StrategyCruncher:
         min_trades_remaining: int = 50,
         min_improvement_pct: float = 5.0,
         n_threshold_bins: int = 100,
-        optimize_metric: Literal['pnl', 'sharpe', 'profit_factor', 'expectancy'] = 'pnl'
+        optimize_metric: Literal[
+            'pnl', 'total_profit', 'win_rate', 'profit_factor', 'expectancy', 'sharpe', 'sharpe_ratio'
+        ] = 'total_profit'
     ):
         """
-        Initialize the Strategy Cruncher.
+        Initialize the FireEye optimizer (StrategyCruncher).
         
         Args:
             min_trades_remaining: Minimum trades that must remain after applying a rule
@@ -147,7 +219,11 @@ class StrategyCruncher:
         """Calculate a single scalar metric for a dataframe (used by crunch)."""
         if len(df) == 0:
             return 0.0
-        pnl = df[pnl_column]
+        pnl = pd.to_numeric(df[pnl_column], errors="coerce")
+        if pnl.isna().any():
+            raise ValueError(
+                f"PnL column {pnl_column!r} contains NaN or non-numeric values; remove or fix those rows."
+            )
         if metric == "profit_factor":
             wins = pnl[pnl > 0].sum()
             losses = abs(pnl[pnl < 0].sum())
@@ -156,8 +232,12 @@ class StrategyCruncher:
             return float(pnl.mean())
         elif metric == "win_rate":
             return float((pnl > 0).mean() * 100)
-        elif metric == "total_profit":
+        elif metric == "total_profit" or metric == "pnl":
             return float(pnl.sum())
+        elif metric in ("sharpe", "sharpe_ratio"):
+            if len(pnl) < 2 or pnl.std() == 0:
+                return 0.0
+            return float((pnl.mean() / pnl.std()) * np.sqrt(252))
         return float(pnl.sum())
 
     def _is_usable_numeric_series(self, series: pd.Series) -> bool:
@@ -180,22 +260,24 @@ class StrategyCruncher:
             "holding", "Unrealized", "Realized",
         ]
 
-    # Column naming convention (aligns with backtestlibrary + librarycolumn):
-    # - Entry_Col_*   = snapshot at entry time (use for ENTRY crunch only)
-    # - Col_*_Exit   = snapshot at exit time (exit crunch only; never for entry)
-    # - Continuous_Col_* / Cont_* = continuous tracking (_Entry, _Exit, _Max, _Min, _At30min...); exit-side, NOT entry
+    # Column naming — backtestlibrary.columns (ENTRY_COLUMN_PREFIX / EXIT_COLUMN_PREFIX /
+    # CONTINUOUS_COLUMN_PREFIX): apply_entry_columns writes Entry_Col_{Col_*}, apply_exit_columns
+    # writes Exit_Col_{Col_*}, continuous tracking writes Continuous_Col_{base}_{Entry|Exit|Max|Min|At30min|At60min}.
 
     def _detect_entry_columns(self, df: pd.DataFrame) -> List[str]:
         """
         Auto-detect entry-only columns for entry crunch.
-        Uses ONLY: Entry_Col_* (entry snapshot) and Col_* that are not exit/forward-looking.
-        Excludes: Col_*_Exit, Continuous_* / Cont_* (continuous), and any name with MFE/MAE/Unrealized/etc.
+        Accepts: Entry_Col_* (backtestlibrary entry snapshots) and bare Col_* when present
+        (e.g. wide-format rows without the Entry_ prefix).
+        Rejects: Exit_Col_* (exit snapshots), Continuous_* / Cont_* (intra-trade paths), and
+        names matching forward-looking / exit-derived heuristics (MFE, MAE, Unrealized, etc.).
         """
         exit_substrings = self._get_entry_exclusion_terms()
         entry_cols = []
         for c in df.columns:
-            # Must be entry-prefixed or bare Col_* (no continuous or exit columns)
             if c.startswith("Cont_") or c.startswith("Continuous_"):
+                continue
+            if c.startswith("Exit_"):
                 continue
             is_entry_prefixed = c.startswith("Entry_Col_")
             is_bare_col = c.startswith("Col_") and not c.endswith("_Exit") and "_Exit" not in c
@@ -207,7 +289,21 @@ class StrategyCruncher:
                 continue
             entry_cols.append(c)
         return entry_cols
-    
+
+    def _require_entry_columns(
+        self, df: pd.DataFrame, where: str, entry_cols: List[str]
+    ) -> None:
+        """Raise if no entry-style columns; lists file headers for debugging."""
+        if entry_cols:
+            return
+        raise ValueError(
+            f"{where}: No usable entry-style columns found. "
+            "Expected columns like backtestlibrary exports: 'Entry_Col_*' (entry snapshot) "
+            "or bare 'Col_*' in wide format — not 'Exit_Col_*', not 'Continuous_Col_*', "
+            "not forward-looking exit metrics. "
+            f"Columns in file: {list(df.columns)!r}"
+        )
+
     def crunch(
         self,
         df: pd.DataFrame,
@@ -226,8 +322,8 @@ class StrategyCruncher:
         Args:
             df: Backtest DataFrame
             pnl_column: P&L column name (net_pnl, profit, etc.)
-            target_metric: 'profit_factor', 'expectancy', 'win_rate', or 'total_profit'
-            min_trades: Minimum trades after each rule
+            target_metric: profit_factor, expectancy, win_rate, total_profit, sharpe_ratio, etc.
+            min_trades: Minimum trades after each rule (use aggression factor in the UI)
             min_improvement_pct: Minimum % improvement to accept a rule
             max_rules: Maximum rules to apply
             verbose: Print progress to stdout
@@ -238,16 +334,18 @@ class StrategyCruncher:
             - filtered_df: trades remaining after all rules
             - before_curve: cumulative P&L of original trades (chronological when time cols present)
             - after_curve: cumulative P&L of filtered trades (chronological when time cols present)
+
+        Raises:
+            ValueError: If the frame has no usable Entry_Col_* / Col_* columns (lists all headers;
+                naming matches backtestlibrary ``columns.py``).
         """
         if pnl_column not in df.columns:
             raise ValueError(f"PnL column '{pnl_column}' not found. Available: {list(df.columns)}")
         
-        # Auto-detect entry columns (no exit columns)
+        # Auto-detect entry columns (no exit columns); no silent fallback
         self.entry_columns = self._detect_entry_columns(df)
-        if not self.entry_columns:
-            # Fallback: use indicator columns (works when CSV has no Col_* columns)
-            self.entry_columns = self._detect_indicator_columns(df, pnl_column, None)
-        
+        self._require_entry_columns(df, "crunch()", self.entry_columns)
+
         current_df = df.copy()
         baseline = self._calculate_metric(current_df, target_metric, pnl_column)
         results: List[Dict] = []
@@ -278,9 +376,9 @@ class StrategyCruncher:
                 for thresh in np.unique(thresholds):
                     for direction in [">", "<"]:
                         if direction == ">":
-                            mask = current_df[col] > thresh
+                            mask = (current_df[col] >= thresh).fillna(False)
                         else:
-                            mask = current_df[col] < thresh
+                            mask = (current_df[col] < thresh).fillna(False)
                         filtered = current_df[mask]
                         if len(filtered) < min_trades:
                             continue
@@ -289,7 +387,11 @@ class StrategyCruncher:
                         if score == float('inf'):
                             score = 999.0
                         denom = abs(baseline) if baseline != 0 else 1e-9
+                        if not np.isfinite(score) or not np.isfinite(baseline):
+                            continue
                         improvement = (score - baseline) / denom * 100
+                        if not np.isfinite(improvement):
+                            continue
                         if improvement >= min_improvement_pct and score > best_score:
                             best_score = score
                             best_rule = {
@@ -312,9 +414,9 @@ class StrategyCruncher:
             col = best_rule["column"]
             thresh = best_rule["threshold"]
             if best_rule["direction"] == ">":
-                current_df = current_df[current_df[col] > thresh]
+                current_df = current_df[(current_df[col] >= thresh).fillna(False)]
             else:
-                current_df = current_df[current_df[col] < thresh]
+                current_df = current_df[(current_df[col] < thresh).fillna(False)]
 
             # Enrich rule with full metrics (for analyze() conversion to RuleCandidate)
             metrics = self._calculate_metrics(current_df, pnl_column)
@@ -339,10 +441,11 @@ class StrategyCruncher:
             
             if verbose:
                 dir_sym = best_rule['direction']
-                pf = best_rule['new_metric']
+                mval = best_rule['new_metric']
                 imp = best_rule['improvement_pct']
                 n_tr = best_rule['trades_remaining']
-                print(f"Rule {rule_num}: {col} {dir_sym} {thresh}   -> PF {pf:.2f} (+{imp:.0f}%) | Trades: {n_tr:,}")
+                ml = target_metric.replace("_", " ").title()
+                print(f"Rule {rule_num}: {col} {dir_sym} {thresh}   -> {ml} {mval:.4g} (+{imp:.0f}%) | Trades: {n_tr:,}")
         
         _after_sorted = (
             current_df.sort_values(sort_cols) if sort_cols and len(current_df) > 0 else current_df
@@ -357,7 +460,8 @@ class StrategyCruncher:
             initial_metric = self._calculate_metric(df, target_metric, pnl_column)
             final_metric = self._calculate_metric(current_df, target_metric, pnl_column)
             pct = (final_metric - initial_metric) / (abs(initial_metric) or 1e-9) * 100
-            print(f"\nFinal Strategy: {len(results)} rules | PF {final_metric:.2f} (+{pct:.0f}%) | Trades: {len(current_df):,}")
+            ml = target_metric.replace("_", " ").title()
+            print(f"\nFinal Strategy: {len(results)} rules | {ml} {final_metric:.4g} (+{pct:.0f}%) | Trades: {len(current_df):,}")
             print("=" * 60)
         
         return results, current_df, before_curve, after_curve
@@ -371,32 +475,52 @@ class StrategyCruncher:
         return pd.read_csv(path)
 
     def _crunch_rules_to_rule_candidates(
-        self, crunch_rules: List[Dict], baseline_metrics: Dict
+        self,
+        crunch_rules: List[Dict],
+        baseline_metrics: Dict,
+        df: pd.DataFrame,
+        pnl_column: str,
     ) -> List[RuleCandidate]:
-        """Convert crunch rule dicts to RuleCandidate objects."""
+        """Convert crunch rule dicts to RuleCandidate objects (report metrics on full backtest)."""
         out = []
         for r in crunch_rules:
             direction = "above" if r["direction"] == ">" else "below"
+            qb, qw, qimprove = curve_quality_metrics_for_rule(
+                df, pnl_column, r["column"], direction, float(r["threshold"])
+            )
+            col = df[r["column"]]
+            if direction == "above":
+                passes = (col >= float(r["threshold"])).fillna(False)
+            else:
+                passes = (col < float(r["threshold"])).fillna(False)
+            pnl = df[pnl_column].astype(float)
+            better_mean = float(pnl[passes].mean()) if passes.any() else 0.0
+            worse_mean = float(pnl[~passes].mean()) if (~passes).any() else 0.0
+            spread = better_mean - worse_mean
             out.append(
                 RuleCandidate(
                     column=r["column"],
                     direction=direction,
                     threshold=r["threshold"],
                     trades_remaining=r["trades_remaining"],
-                    trades_filtered=r.get("trades_filtered", 0),
-                    total_pnl=r.get("total_pnl", 0),
-                    win_rate=r.get("win_rate", 0),
-                    avg_win=r.get("avg_win", 0),
-                    avg_loss=r.get("avg_loss", 0),
-                    profit_factor=r.get("profit_factor", 0),
-                    sharpe_ratio=r.get("sharpe_ratio", 0),
-                    max_drawdown=r.get("max_drawdown", 0),
-                    expectancy=r.get("expectancy", 0),
-                    pnl_improvement=r.get("pnl_improvement", 0),
-                    pnl_improvement_pct=r.get("pnl_improvement_pct", 0),
-                    win_rate_improvement=r.get("win_rate_improvement", 0),
-                    expectancy_improvement=r.get("expectancy_improvement", 0),
-                    edge_score=r.get("edge_score", r.get("improvement_pct", 0) / 100.0),
+                    trades_filtered=r["trades_filtered"],
+                    total_pnl=r["total_pnl"],
+                    win_rate=r["win_rate"],
+                    avg_win=r["avg_win"],
+                    avg_loss=r["avg_loss"],
+                    profit_factor=r["profit_factor"],
+                    sharpe_ratio=r["sharpe_ratio"],
+                    max_drawdown=r["max_drawdown"],
+                    expectancy=r["expectancy"],
+                    pnl_improvement=r["pnl_improvement"],
+                    pnl_improvement_pct=r["pnl_improvement_pct"],
+                    win_rate_improvement=r["win_rate_improvement"],
+                    expectancy_improvement=r["expectancy_improvement"],
+                    mean_profit_spread=spread,
+                    curve_quality_better=qb,
+                    curve_quality_worse=qw,
+                    curve_quality_improvement=qimprove,
+                    edge_score=spread,
                 )
             )
         return out
@@ -421,7 +545,8 @@ class StrategyCruncher:
         Args:
             data: DataFrame or path to CSV file
             pnl_column: Name of the P&L column
-            indicator_columns: List of columns to analyze (if None, auto-detect)
+            indicator_columns: Columns to analyze; if None, uses entry-style columns only
+                (Entry_Col_* / Col_*). Raises ValueError if none are found—fix the file or pass an explicit list.
             exclude_columns: List of columns to exclude from analysis
             analyze_column_library: Whether to analyze column library for recommendations
             library_path: Path to column library Excel file
@@ -456,18 +581,15 @@ class StrategyCruncher:
             )
             baseline = self._calculate_metrics(df, pnl_column)
             rule_candidates = self._crunch_rules_to_rule_candidates(
-                crunch_rules, baseline
+                crunch_rules, baseline, df, pnl_column
             )
             column_recommendations = None
             if analyze_column_library:
-                try:
-                    from .column_library_analyzer import ColumnLibraryAnalyzer
-                    analyzer = ColumnLibraryAnalyzer(library_path)
-                    column_recommendations = analyzer.analyze(
-                        df, pnl_column=pnl_column
-                    )
-                except Exception as e:
-                    warnings.warn(f"Could not analyze column library: {e}")
+                from .column_library_analyzer import ColumnLibraryAnalyzer
+                analyzer = ColumnLibraryAnalyzer(library_path)
+                column_recommendations = analyzer.analyze(
+                    df, pnl_column=pnl_column
+                )
             result = OptimizationResult(
                 baseline_metrics=baseline,
                 rules=rule_candidates,
@@ -476,16 +598,23 @@ class StrategyCruncher:
             )
             return result
 
-        # Legacy single-pass mode (deprecated)
-        warnings.warn(
-            "analyze(iterative=False) is deprecated. Prefer crunch() or analyze(iterative=True).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+        # Legacy single-pass mode (parallel top-column rules for reports)
         if indicator_columns is None:
-            indicator_columns = self._detect_indicator_columns(
-                df, pnl_column, exclude_columns
+            indicator_columns = self._detect_entry_columns(df)
+            self._require_entry_columns(
+                df, "analyze(iterative=False)", indicator_columns
             )
+            if exclude_columns:
+                _ex = set(exclude_columns)
+                _before = list(indicator_columns)
+                indicator_columns = [c for c in indicator_columns if c not in _ex]
+                if not indicator_columns:
+                    raise ValueError(
+                        "analyze(iterative=False): exclude_columns removed every "
+                        "entry-style column. "
+                        f"exclude_columns={list(exclude_columns)!r}, "
+                        f"detected entry columns before filter: {_before!r}"
+                    )
         
         # Calculate baseline metrics
         baseline = self._calculate_metrics(df, pnl_column)
@@ -496,18 +625,15 @@ class StrategyCruncher:
             rules = self._find_optimal_thresholds(df, col, pnl_column, baseline)
             all_rules.extend(rules)
         
-        # Sort by edge score
-        all_rules.sort(key=lambda r: r.edge_score, reverse=True)
+        # Importance ≈ mean-profit spread (Dave Mabe report ranking)
+        all_rules.sort(key=lambda r: r.mean_profit_spread, reverse=True)
         
-        # Analyze column library if requested
+        # Analyze column library if requested (errors propagate — no silent fallback)
         column_recommendations = None
         if analyze_column_library:
-            try:
-                from .column_library_analyzer import ColumnLibraryAnalyzer
-                analyzer = ColumnLibraryAnalyzer(library_path)
-                column_recommendations = analyzer.analyze(df, pnl_column=pnl_column)
-            except Exception as e:
-                warnings.warn(f"Could not analyze column library: {e}")
+            from .column_library_analyzer import ColumnLibraryAnalyzer
+            analyzer = ColumnLibraryAnalyzer(library_path)
+            column_recommendations = analyzer.analyze(df, pnl_column=pnl_column)
         
         result = OptimizationResult(
             baseline_metrics=baseline,
@@ -520,60 +646,22 @@ class StrategyCruncher:
             result.column_recommendations = column_recommendations
         
         return result
-    
-    def _detect_indicator_columns(
-        self,
-        df: pd.DataFrame,
-        pnl_column: str,
-        exclude_columns: Optional[List[str]] = None
-    ) -> List[str]:
-        """
-        Fallback for entry-column detection when no Entry_Col_* / Col_* found.
-        Returns only columns safe for ENTRY crunch: excludes exit snapshots,
-        continuous columns, and forward-looking terms (MFE, MAE, Unrealized, etc.).
-        """
-        default_exclude = {
-            'shares', 'entry_value', 'exit_value', 'gross_pnl', 'commission',
-            'sec_taf_fee', 'slippage', 'gst', 'borrow_cost', 'net_pnl',
-            'account_balance_before', 'account_balance_after', 'entry_price',
-            'exit_price', 'entry_time', 'exit_time', 'holding_minutes',
-            'bars_held', 'trade_duration', 'benchmark_price', 'Unnamed: 0', 'index',
-            'pct_move', 'abs_pct_move', 'win_streak', 'loss_streak',
-            'pnl_5_trade_avg', 'pnl_10_trade_avg', 'pnl_20_trade_avg',
-            'cumulative_pnl', 'running_pnl',
-        }
-        if exclude_columns:
-            default_exclude.update(exclude_columns)
-        default_exclude.add(pnl_column)
 
-        exit_substrings = self._get_entry_exclusion_terms()
-
-        indicator_cols = []
-        for col in df.columns:
-            if col in default_exclude:
-                continue
-            # Do not use exit or continuous columns for entry crunch
-            if col.startswith("Cont_") or col.startswith("Continuous_"):
-                continue
-            if "_Exit" in col or col.endswith("_Exit"):
-                continue
-            if any(x.lower() in col.lower() for x in exit_substrings):
-                continue
-            if not self._is_usable_numeric_series(df[col]):
-                continue
-            indicator_cols.append(col)
-        return indicator_cols
-    
     def _calculate_metrics(self, df: pd.DataFrame, pnl_column: str) -> Dict:
         """Calculate comprehensive trading metrics."""
-        pnl = df[pnl_column].values
+        pnl = pd.to_numeric(df[pnl_column], errors="coerce").to_numpy(dtype=float)
+        if np.isnan(pnl).any():
+            raise ValueError(
+                f"PnL column {pnl_column!r} contains NaN or non-numeric values; remove or fix those rows."
+            )
         n_trades = len(pnl)
         
         if n_trades == 0:
             return {
                 'n_trades': 0, 'total_pnl': 0, 'win_rate': 0,
                 'avg_win': 0, 'avg_loss': 0, 'profit_factor': 0,
-                'sharpe_ratio': 0, 'max_drawdown': 0, 'expectancy': 0
+                'sharpe_ratio': 0, 'max_drawdown': 0, 'expectancy': 0,
+                'calmar_ratio': 0.0,
             }
         
         wins = pnl[pnl > 0]
@@ -610,6 +698,8 @@ class StrategyCruncher:
         # Expectancy (average profit per trade)
         expectancy = total_pnl / n_trades if n_trades > 0 else 0
         
+        cr = calmar_ratio(total_pnl, max_drawdown)
+        
         return {
             'n_trades': n_trades,
             'total_pnl': total_pnl,
@@ -619,7 +709,8 @@ class StrategyCruncher:
             'profit_factor': profit_factor,
             'sharpe_ratio': sharpe_ratio,
             'max_drawdown': max_drawdown,
-            'expectancy': expectancy
+            'expectancy': expectancy,
+            'calmar_ratio': cr,
         }
     
     def _find_optimal_thresholds(
@@ -640,8 +731,12 @@ class StrategyCruncher:
         # Generate threshold candidates
         thresholds = self._generate_thresholds(values)
         
-        pnl_values = df[pnl_column].values
-        col_values = df[column].values
+        col_series = df[column]
+        pnl_values = pd.to_numeric(df[pnl_column], errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(pnl_values).all():
+            raise ValueError(
+                f"PnL column {pnl_column!r} contains NaN or non-numeric values; remove or fix those rows."
+            )
         
         # Test both directions: keep above threshold, keep below threshold
         for direction in ['above', 'below']:
@@ -649,25 +744,27 @@ class StrategyCruncher:
             best_score = -np.inf
             
             for thresh in thresholds:
+                tf = float(thresh)
                 if direction == 'above':
-                    mask = col_values > thresh
+                    passes = col_series.ge(tf).fillna(False).to_numpy()
                 else:
-                    mask = col_values < thresh
+                    passes = col_series.lt(tf).fillna(False).to_numpy()
+                final_mask = passes
+                worse_mask = ~passes
                 
-                # Handle NaN values - exclude them
-                nan_mask = ~np.isnan(col_values)
-                final_mask = mask & nan_mask
-                
-                trades_remaining = final_mask.sum()
+                trades_remaining = int(final_mask.sum())
+                n_worse = int(worse_mask.sum())
                 
                 if trades_remaining < self.min_trades_remaining:
                     continue
+                if n_worse < max(10, min(self.min_trades_remaining // 5, 100)):
+                    continue
                 
-                # Calculate metrics for filtered trades
+                # Calculate metrics for filtered trades (better set)
                 filtered_pnl = pnl_values[final_mask]
                 metrics = self._calculate_metrics_from_pnl(filtered_pnl)
                 
-                # Calculate improvements
+                # Calculate improvements vs full backtest baseline
                 pnl_improvement = metrics['total_pnl'] - baseline['total_pnl']
                 if baseline['total_pnl'] != 0:
                     pnl_improvement_pct = (pnl_improvement / abs(baseline['total_pnl']) * 100)
@@ -679,36 +776,49 @@ class StrategyCruncher:
                 if pnl_improvement_pct < self.min_improvement_pct:
                     continue
                 
+                mean_better = float(np.mean(pnl_values[final_mask]))
+                mean_worse = float(np.mean(pnl_values[worse_mask])) if n_worse > 0 else 0.0
+                mean_spread = mean_better - mean_worse
+                # Dave Mabe: optimal split maximizes avg-profit gap between better and worse sets
+                if mean_spread <= 0:
+                    continue
+                
+                if mean_spread <= best_score:
+                    continue
+                
                 win_rate_improvement = metrics['win_rate'] - baseline['win_rate']
                 expectancy_improvement = metrics['expectancy'] - baseline['expectancy']
                 
-                # Calculate edge score (composite ranking metric)
-                edge_score = self._calculate_edge_score(
-                    metrics, baseline, trades_remaining, len(df)
+                qb, qw, qimp = curve_quality_metrics_for_rule(
+                    df, pnl_column, column, direction, tf
                 )
                 
-                if edge_score > best_score:
-                    best_score = edge_score
-                    best_rule = RuleCandidate(
-                        column=column,
-                        direction=direction,
-                        threshold=thresh,
-                        trades_remaining=trades_remaining,
-                        trades_filtered=len(df) - trades_remaining,
-                        total_pnl=metrics['total_pnl'],
-                        win_rate=metrics['win_rate'],
-                        avg_win=metrics['avg_win'],
-                        avg_loss=metrics['avg_loss'],
-                        profit_factor=metrics['profit_factor'],
-                        sharpe_ratio=metrics['sharpe_ratio'],
-                        max_drawdown=metrics['max_drawdown'],
-                        expectancy=metrics['expectancy'],
-                        pnl_improvement=pnl_improvement,
-                        pnl_improvement_pct=pnl_improvement_pct,
-                        win_rate_improvement=win_rate_improvement,
-                        expectancy_improvement=expectancy_improvement,
-                        edge_score=edge_score
-                    )
+                best_score = mean_spread
+                n_not_better = int((~passes).sum())
+                best_rule = RuleCandidate(
+                    column=column,
+                    direction=direction,
+                    threshold=thresh,
+                    trades_remaining=trades_remaining,
+                    trades_filtered=n_not_better,
+                    total_pnl=metrics['total_pnl'],
+                    win_rate=metrics['win_rate'],
+                    avg_win=metrics['avg_win'],
+                    avg_loss=metrics['avg_loss'],
+                    profit_factor=metrics['profit_factor'],
+                    sharpe_ratio=metrics['sharpe_ratio'],
+                    max_drawdown=metrics['max_drawdown'],
+                    expectancy=metrics['expectancy'],
+                    pnl_improvement=pnl_improvement,
+                    pnl_improvement_pct=pnl_improvement_pct,
+                    win_rate_improvement=win_rate_improvement,
+                    expectancy_improvement=expectancy_improvement,
+                    mean_profit_spread=mean_spread,
+                    curve_quality_better=qb,
+                    curve_quality_worse=qw,
+                    curve_quality_improvement=qimp,
+                    edge_score=mean_spread,
+                )
             
             if best_rule is not None:
                 rules.append(best_rule)
@@ -728,13 +838,17 @@ class StrategyCruncher:
     
     def _calculate_metrics_from_pnl(self, pnl: np.ndarray) -> Dict:
         """Calculate metrics from a PnL array."""
+        pnl = np.asarray(pnl, dtype=float)
+        if np.isnan(pnl).any():
+            raise ValueError("Internal error: PnL slice contained NaN in _calculate_metrics_from_pnl.")
         n_trades = len(pnl)
         
         if n_trades == 0:
             return {
                 'n_trades': 0, 'total_pnl': 0, 'win_rate': 0,
                 'avg_win': 0, 'avg_loss': 0, 'profit_factor': 0,
-                'sharpe_ratio': 0, 'max_drawdown': 0, 'expectancy': 0
+                'sharpe_ratio': 0, 'max_drawdown': 0, 'expectancy': 0,
+                'calmar_ratio': 0.0,
             }
         
         wins = pnl[pnl > 0]
@@ -765,6 +879,8 @@ class StrategyCruncher:
         
         expectancy = total_pnl / n_trades if n_trades > 0 else 0
         
+        cr = calmar_ratio(total_pnl, max_drawdown)
+        
         return {
             'n_trades': n_trades,
             'total_pnl': total_pnl,
@@ -774,54 +890,9 @@ class StrategyCruncher:
             'profit_factor': profit_factor,
             'sharpe_ratio': sharpe_ratio,
             'max_drawdown': max_drawdown,
-            'expectancy': expectancy
+            'expectancy': expectancy,
+            'calmar_ratio': cr,
         }
-    
-    def _calculate_edge_score(
-        self,
-        metrics: Dict,
-        baseline: Dict,
-        trades_remaining: int,
-        total_trades: int
-    ) -> float:
-        """
-        Calculate a composite edge score for ranking rules.
-        
-        Higher score = more valuable rule.
-        Balances improvement in metrics with trade retention.
-        """
-        # Normalize improvements
-        pnl_factor = 0
-        if baseline['total_pnl'] != 0:
-            pnl_factor = (metrics['total_pnl'] - baseline['total_pnl']) / abs(baseline['total_pnl'])
-        elif metrics['total_pnl'] > 0:
-            pnl_factor = 1.0  # Going from 0 to positive is good
-        
-        # Win rate improvement (weighted)
-        wr_factor = (metrics['win_rate'] - baseline['win_rate']) * 2
-        
-        # Profit factor improvement
-        pf_baseline = baseline['profit_factor'] if baseline['profit_factor'] != float('inf') else 2
-        pf_current = metrics['profit_factor'] if metrics['profit_factor'] != float('inf') else 2
-        pf_factor = (pf_current - pf_baseline) / max(pf_baseline, 0.5) * 0.5
-        
-        # Trade retention penalty (prefer keeping more trades)
-        retention = trades_remaining / total_trades
-        retention_factor = retention ** 0.5  # Square root to soften penalty
-        
-        # Sharpe improvement
-        sharpe_factor = 0
-        if baseline['sharpe_ratio'] != 0:
-            sharpe_factor = (metrics['sharpe_ratio'] - baseline['sharpe_ratio']) / abs(baseline['sharpe_ratio']) * 0.3
-        
-        # Composite score
-        score = (pnl_factor + wr_factor + pf_factor + sharpe_factor) * retention_factor
-        
-        # Bonus for significant improvements with good retention
-        if pnl_factor > 0.2 and retention > 0.3:
-            score *= 1.2
-        
-        return score
     
     def analyze_rule_combinations(
         self,
@@ -852,10 +923,12 @@ class StrategyCruncher:
                 filtered_df = df.copy()
                 
                 for rule in rule_combo:
+                    col = filtered_df[rule.column]
                     if rule.direction == 'above':
-                        filtered_df = filtered_df[filtered_df[rule.column] > rule.threshold]
+                        m = col.ge(rule.threshold).fillna(False)
                     else:
-                        filtered_df = filtered_df[filtered_df[rule.column] < rule.threshold]
+                        m = col.lt(rule.threshold).fillna(False)
+                    filtered_df = filtered_df[m]
                 
                 if len(filtered_df) >= self.min_trades_remaining:
                     metrics = self._calculate_metrics(filtered_df, pnl_column)
@@ -884,7 +957,7 @@ def quick_analyze(
         top_n: Number of top rules to display
     """
     print(f"\n{'='*70}")
-    print("STRATEGY CRUNCHER - Backtest Optimization Analysis")
+    print("FIREEYE - Backtest Optimization Analysis")
     print(f"{'='*70}\n")
     
     cruncher = StrategyCruncher()
@@ -904,13 +977,14 @@ def quick_analyze(
     print(f"  Max Drawdown:    ${baseline['max_drawdown']:,.2f}")
     print(f"  Expectancy:      ${baseline['expectancy']:.2f}/trade")
     
-    print(f"\n\nTOP {top_n} OPTIMIZATION RULES (Ranked by Edge Score)")
+    print(f"\n\nTOP {top_n} OPTIMIZATION RULES (Ranked by mean $/trade spread)")
     print("=" * 70)
     
     for i, rule in enumerate(results.get_top_rules(top_n), 1):
-        dir_symbol = '>' if rule.direction == 'above' else '<'
+        dir_symbol = '>=' if rule.direction == 'above' else '<'
         print(f"\n#{i}. {rule.column} {dir_symbol} {rule.threshold:.4f}")
-        print(f"    Edge Score:      {rule.edge_score:.3f}")
+        print(f"    Mean $ spread:   {rule.mean_profit_spread:.4f}")
+        print(f"    Curve Q Δ:       {rule.curve_quality_improvement:.4f}")
         print(f"    Trades Kept:     {rule.trades_remaining:,} ({rule.trades_remaining/baseline['n_trades']:.1%} of original)")
         print(f"    Total P&L:       ${rule.total_pnl:,.2f} ({rule.pnl_improvement_pct:+.1f}%)")
         print(f"    Win Rate:        {rule.win_rate:.1%} ({rule.win_rate_improvement:+.1%})")

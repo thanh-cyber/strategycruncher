@@ -1,8 +1,7 @@
 """
-Strategy Cruncher - Interactive Web Application
+FireEye — Interactive Web Application
 
-A powerful tool for analyzing backtest data and finding optimal indicator thresholds.
-Inspired by Dave Mabe's systematic trading approach.
+Backtest threshold discovery and rule discovery. Inspired by Dave Mabe's systematic trading approach.
 
 Run with: streamlit run strategy_cruncher/app.py
 """
@@ -17,216 +16,608 @@ from typing import List, Optional
 import io
 import sys
 import os
+import math
 
-# Handle both direct execution and package import
+# Package import (Streamlit may run app as a script; second attempt must fail loud if still broken)
 try:
     from .cruncher import StrategyCruncher, OptimizationResult, RuleCandidate
-except ImportError:
-    # When run directly with streamlit
+except ImportError as _e_rel:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from strategy_cruncher.cruncher import StrategyCruncher, OptimizationResult, RuleCandidate
+    try:
+        from strategy_cruncher.cruncher import StrategyCruncher, OptimizationResult, RuleCandidate
+    except ImportError as _e_abs:
+        raise ImportError(
+            "Cannot import strategy_cruncher. Install the package (pip install -e .) or run from the repo root."
+        ) from _e_abs
 
-# Page configuration
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_FIREEYE_LOGO = os.path.join(_APP_DIR, "assets", "fireeye_logo.png")
+
+# Dave Mabe crunch defaults (sidebar focuses on Optimize on + aggression factor)
+_DEFAULT_MIN_IMPROVEMENT_PCT = 8.0
+_DEFAULT_MAX_RULES = 8
+_DEFAULT_N_THRESHOLD_BINS = 100
+
+# Display label -> StrategyCruncher.optimize_metric / crunch target_metric
+OPTIMIZE_ON_OPTIONS: list[tuple[str, str]] = [
+    ("Profit (total P&L)", "total_profit"),
+    ("Win rate", "win_rate"),
+    ("Profit factor", "profit_factor"),
+    ("Expectancy (avg per trade)", "expectancy"),
+    ("Sharpe ratio", "sharpe_ratio"),
+]
+
+# UI theme: FireEye brand (red/black) + institutional mono data
+_JS_THEME: dict = {
+    "bg": "#4a4a4a",
+    "panel": "#3f3f3f",
+    "card": "#525252",
+    "border": "#666666",
+    "text": "#e8e8e5",
+    "muted": "#ffffff",
+    "dim": "#5c5c58",
+    "accent": "#d21f2d",
+    "positive": "#4d9b73",
+    "negative": "#b95550",
+    "neutral": "#9a9a96",
+    "plot_bg": "rgba(58, 58, 58, 0.95)",
+    "grid": "#6e6e6e",
+    "font_mono": "IBM Plex Mono, monospace",
+    "font_sans": "IBM Plex Sans, system-ui, sans-serif",
+}
+
+
+def _plotly_base_font() -> dict:
+    return dict(family=_JS_THEME["font_mono"], color=_JS_THEME["muted"])
+
+
+def _plotly_chart_layout(**extra) -> dict:
+    base = dict(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor=_JS_THEME["plot_bg"],
+        font=_plotly_base_font(),
+    )
+    base.update(extra)
+    return base
+
+
+def min_trades_from_aggression(n_trades: int, aggression_pct: int) -> int:
+    """Minimum filtered trade count = aggression percent of backtest size (Dave Mabe: 1–49)."""
+    ap = int(max(1, min(49, aggression_pct)))
+    return max(1, int(np.ceil(n_trades * ap / 100.0)))
+
+
+def _load_df_from_upload(file_bytes: bytes, fname_lower: str, mime_lower: str) -> pd.DataFrame:
+    """Parse uploaded bytes as CSV or Excel (same rules as previous inline loader)."""
+    bio = io.BytesIO(file_bytes)
+    is_excel = fname_lower.endswith((".xlsx", ".xls")) or (
+        "spreadsheetml" in mime_lower or "ms-excel" in mime_lower
+    )
+    if is_excel:
+        engine = (
+            "openpyxl"
+            if fname_lower.endswith(".xlsx") or "spreadsheetml.sheet" in mime_lower
+            else None
+        )
+        return pd.read_excel(bio, engine=engine)
+    return pd.read_csv(bio)
+
+
+@st.cache_data(show_spinner="Running FireEye analysis…")
+def _cached_fireeye_analysis(
+    file_bytes: bytes,
+    fname_lower: str,
+    mime_lower: str,
+    pnl_column: str,
+    aggression_pct: int,
+    optimize_metric: str,
+    crunch_mode: bool,
+    analyze_library: bool,
+    library_path: str,
+):
+    """
+    Run legacy report analyze + optional iterative crunch. Cached on file bytes and parameters
+    so changing tabs / sort widgets does not repeat this work.
+    """
+    df = _load_df_from_upload(file_bytes, fname_lower, mime_lower)
+    if len(df) == 0:
+        raise ValueError("Uploaded file has no data rows.")
+    if pnl_column not in df.columns:
+        raise ValueError(
+            f"Column '{pnl_column}' not found in data. Available columns: {list(df.columns)}"
+        )
+
+    n_trades_bt = len(df)
+    min_trades = min_trades_from_aggression(n_trades_bt, aggression_pct)
+    cruncher = StrategyCruncher(
+        min_trades_remaining=min_trades,
+        min_improvement_pct=_DEFAULT_MIN_IMPROVEMENT_PCT,
+        n_threshold_bins=_DEFAULT_N_THRESHOLD_BINS,
+        optimize_metric=optimize_metric,
+    )
+    baseline_metrics = cruncher._calculate_metrics(df, pnl_column)
+    report_result = cruncher.analyze(
+        df,
+        pnl_column=pnl_column,
+        iterative=False,
+        analyze_column_library=analyze_library,
+        library_path=library_path,
+    )
+    if crunch_mode:
+        crunch_rules, filtered_df, _, _ = cruncher.crunch(
+            df,
+            pnl_column=pnl_column,
+            target_metric=cruncher.optimize_metric,
+            min_trades=min_trades,
+            min_improvement_pct=_DEFAULT_MIN_IMPROVEMENT_PCT,
+            max_rules=_DEFAULT_MAX_RULES,
+            verbose=False,
+        )
+        final_metrics = (
+            cruncher._calculate_metrics(filtered_df, pnl_column)
+            if len(filtered_df) > 0
+            else baseline_metrics
+        )
+    else:
+        crunch_rules = None
+        filtered_df = None
+        final_metrics = None
+
+    return (
+        df,
+        report_result,
+        crunch_rules,
+        filtered_df,
+        baseline_metrics,
+        final_metrics,
+    )
+
+
+def _equity_sort_columns(df: pd.DataFrame) -> List[str]:
+    return [c for c in ("date", "entry_date", "entry_time", "EntryTime") if c in df.columns]
+
+
+def rule_passes_series(df: pd.DataFrame, rule: RuleCandidate) -> pd.Series:
+    """True = trade satisfies the rule (Better); NaN indicator values count as not passing."""
+    col = df[rule.column]
+    if rule.direction == "above":
+        m = col >= rule.threshold
+    else:
+        m = col < rule.threshold
+    return m.fillna(False)
+
+
+def rule_calmar_from_candidate(rule: RuleCandidate) -> float:
+    md = rule.max_drawdown or 0.0
+    if md > 1e-12:
+        return float(rule.total_pnl / md)
+    return float("inf") if rule.total_pnl > 0 else 0.0
+
+
+def create_better_worse_equity_figure(
+    df: pd.DataFrame, pnl_column: str, rule: RuleCandidate
+) -> go.Figure:
+    """
+    Green = cumulative P&L from trades that pass the rule (kept); red = cumulative from trades removed.
+    Chronological order when date/time columns exist (Dave Mabe–style report).
+    """
+    sort_cols = _equity_sort_columns(df)
+    plot_df = (
+        df.sort_values(sort_cols).reset_index(drop=True)
+        if sort_cols
+        else df.reset_index(drop=True)
+    )
+    pnl = plot_df[pnl_column].astype(float).values
+    passes = rule_passes_series(plot_df, rule).values
+    cum_better = np.cumsum(np.where(passes, pnl, 0.0))
+    cum_worse = np.cumsum(np.where(~passes, pnl, 0.0))
+    x = np.arange(len(pnl))
+    sym = "≥" if rule.direction == "above" else "<"
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=cum_better,
+            mode="lines",
+            name="Better (kept)",
+            line=dict(color=_JS_THEME["positive"], width=1.5),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=cum_worse,
+            mode="lines",
+            name="Worse (removed)",
+            line=dict(color=_JS_THEME["negative"], width=1.5),
+        )
+    )
+    fig.update_layout(
+        **_plotly_chart_layout(
+            title=dict(
+                text=f"{rule.column} {sym} {rule.threshold:.4g}",
+                font=dict(size=15, color=_JS_THEME["text"], family=_JS_THEME["font_mono"]),
+            ),
+            xaxis_title="Trade index (time-sorted)" if sort_cols else "Trade index",
+            yaxis_title="Cumulative P&L ($)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            hovermode="x unified",
+            margin=dict(l=60, r=20, t=60, b=40),
+        )
+    )
+    fig.update_xaxes(gridcolor=_JS_THEME["grid"], gridwidth=0.5)
+    fig.update_yaxes(gridcolor=_JS_THEME["grid"], gridwidth=0.5, tickformat="$,.0f")
+    return fig
+
+
+def _fmt_pf(v) -> str:
+    """Format profit factor; handles numpy scalars and +/- inf."""
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if math.isinf(fv) and fv > 0:
+        return "∞"
+    if math.isnan(fv):
+        return "N/A"
+    return f"{fv:.2f}"
+
+
+def _fmt_calmar(v) -> str:
+    """Format Calmar ratio; handles numpy scalars and inf."""
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if math.isinf(fv):
+        return "∞" if fv > 0 else "-∞"
+    if math.isnan(fv):
+        return "N/A"
+    return f"{fv:.2f}"
+
+
+# Page configuration (browser tab uses FireEye logo when bundled asset is present)
+_page_icon = os.path.abspath(_FIREEYE_LOGO)
 st.set_page_config(
-    page_title="Strategy Cruncher",
-    page_icon="📊",
+    page_title="FireEye",
+    page_icon=_page_icon if os.path.isfile(_page_icon) else "🔥",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Custom CSS for a distinctive, professional look
-st.markdown("""
+# Institutional quant desk styling (flat panels, mono data, single accent)
+st.markdown(
+    """
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
-    
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+
     :root {
-        --bg-primary: #0a0e17;
-        --bg-secondary: #111827;
-        --bg-card: #1a2332;
-        --accent-green: #10b981;
-        --accent-red: #ef4444;
-        --accent-blue: #3b82f6;
-        --accent-purple: #8b5cf6;
-        --accent-amber: #f59e0b;
-        --text-primary: #f3f4f6;
-        --text-secondary: #9ca3af;
-        --border-color: #374151;
+        --js-bg: #4a4a4a;
+        --js-panel: #3f3f3f;
+        --js-card: #525252;
+        --js-border: #666666;
+        --js-accent: #d21f2d;
+        --js-text: #e8e8e5;
+        --js-main-fg: #ffffff;
+        --js-muted: #8c8c88;
+        --js-pos: #4d9b73;
+        --js-neg: #b95550;
     }
-    
+
+    /* Default / sidebar: keep warm grey (not pure white) */
+    html, body, .stApp {
+        color: var(--js-text);
+    }
+
     .stApp {
-        background: linear-gradient(135deg, #0a0e17 0%, #111827 50%, #0f172a 100%);
+        background-color: var(--js-bg);
     }
-    
-    .main-header {
-        font-family: 'Space Grotesk', sans-serif;
-        font-size: 2.8rem;
-        font-weight: 700;
-        background: linear-gradient(135deg, #10b981 0%, #3b82f6 50%, #8b5cf6 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        text-align: center;
-        margin-bottom: 0.5rem;
-        letter-spacing: -0.02em;
+
+    [data-testid="stSidebar"] {
+        background-color: var(--js-panel) !important;
+        border-right: 1px solid var(--js-border);
+        color: var(--js-text) !important;
     }
-    
+
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] span,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] h1,
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3,
+    [data-testid="stSidebar"] h4,
+    [data-testid="stSidebar"] .stMarkdown,
+    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p,
+    [data-testid="stSidebar"] [data-testid="stCaption"],
+    [data-testid="stSidebar"] [data-baseweb="input"] input,
+    [data-testid="stSidebar"] textarea,
+    [data-testid="stSidebar"] [data-baseweb="select"] span {
+        color: var(--js-text) !important;
+    }
+
+    [data-testid="stSidebar"] [data-testid="stCaption"] {
+        color: var(--js-muted) !important;
+    }
+
+    /* Main content + top bar: all text white */
+    [data-testid="stHeader"],
+    [data-testid="stHeader"] span,
+    [data-testid="stHeader"] label,
+    [data-testid="stHeader"] button {
+        color: var(--js-main-fg) !important;
+    }
+
+    [data-testid="stMain"],
+    [data-testid="stMain"] p,
+    [data-testid="stMain"] span,
+    [data-testid="stMain"] label,
+    [data-testid="stMain"] h1,
+    [data-testid="stMain"] h2,
+    [data-testid="stMain"] h3,
+    [data-testid="stMain"] h4,
+    [data-testid="stMain"] h5,
+    [data-testid="stMain"] h6,
+    [data-testid="stMain"] li,
+    [data-testid="stMain"] .stMarkdown,
+    [data-testid="stMain"] [data-testid="stMarkdownContainer"] p,
+    [data-testid="stMain"] [data-testid="stMarkdownContainer"] span,
+    [data-testid="stMain"] [data-testid="stMarkdownContainer"] li,
+    [data-testid="stMain"] [data-testid="stWidgetLabel"] p,
+    [data-testid="stMain"] [data-testid="stCaption"],
+    [data-testid="stMain"] [data-baseweb="input"] input,
+    [data-testid="stMain"] textarea,
+    [data-testid="stMain"] [data-baseweb="select"] span,
+    [data-testid="stMain"] .stRadio label,
+    [data-testid="stMain"] .stCheckbox label,
+    [data-testid="stMain"] .stSlider label,
+    [data-testid="stMain"] [data-testid="stMetric"] label,
+    [data-testid="stMain"] [data-testid="stMetric"] [data-testid="stMetricValue"] {
+        color: var(--js-main-fg) !important;
+    }
+
+    [data-testid="stHeader"] {
+        background-color: transparent;
+        border-bottom: 1px solid var(--js-border);
+    }
+
+    [data-testid="stToolbar"] {
+        background: transparent;
+    }
+
+    hr.fireeye-logo-rule {
+        height: 0;
+        margin: 0.35rem 0 0.75rem 0;
+        max-width: 320px;
+        border: none;
+        border-top: 2px solid var(--js-accent);
+    }
+
     .sub-header {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 1rem;
-        color: #9ca3af;
-        text-align: center;
-        margin-bottom: 2rem;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 0.8125rem;
+        font-weight: 400;
+        color: var(--js-main-fg);
+        text-align: left;
+        margin: 0 0 1.5rem 0;
+        line-height: 1.5;
     }
-    
+
     .metric-card {
-        background: linear-gradient(145deg, #1a2332 0%, #111827 100%);
-        border: 1px solid #374151;
-        border-radius: 12px;
-        padding: 1.25rem;
+        background-color: var(--js-card);
+        border: 1px solid var(--js-border);
+        border-radius: 2px;
+        padding: 0.9rem 1rem;
         margin: 0.5rem 0;
-        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
     }
-    
+
     .metric-label {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.75rem;
-        color: #6b7280;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 0.6875rem;
+        color: var(--js-main-fg);
         text-transform: uppercase;
-        letter-spacing: 0.1em;
-        margin-bottom: 0.25rem;
+        letter-spacing: 0.08em;
+        margin-bottom: 0.35rem;
     }
-    
+
     .metric-value {
-        font-family: 'Space Grotesk', sans-serif;
-        font-size: 1.75rem;
-        font-weight: 700;
-        color: #f3f4f6;
+        font-family: "IBM Plex Sans", system-ui, sans-serif;
+        font-size: 1.35rem;
+        font-weight: 600;
+        color: var(--js-main-fg);
     }
-    
-    .metric-value.positive { color: #10b981; }
-    .metric-value.negative { color: #ef4444; }
-    
+
+    .metric-value.positive { color: var(--js-pos); }
+    .metric-value.negative { color: var(--js-neg); }
+
     .rule-card {
-        background: linear-gradient(145deg, #1e293b 0%, #1a2332 100%);
-        border: 1px solid #374151;
-        border-left: 4px solid #3b82f6;
-        border-radius: 8px;
-        padding: 1rem 1.25rem;
-        margin: 0.75rem 0;
-        transition: all 0.2s ease;
+        background-color: var(--js-card);
+        border: 1px solid var(--js-border);
+        border-left: 3px solid var(--js-accent);
+        border-radius: 2px;
+        padding: 0.85rem 1rem;
+        margin: 0.6rem 0;
     }
-    
-    .rule-card:hover {
-        border-left-color: #10b981;
-        transform: translateX(4px);
-        box-shadow: 0 4px 20px rgba(16, 185, 129, 0.15);
-    }
-    
+
     .rule-rank {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.875rem;
-        color: #8b5cf6;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 0.8125rem;
+        color: var(--js-accent);
         font-weight: 600;
     }
-    
+
     .rule-expression {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 1.1rem;
-        color: #f3f4f6;
-        margin: 0.5rem 0;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 0.9375rem;
+        color: var(--js-main-fg);
+        margin: 0.4rem 0;
     }
-    
+
     .rule-stats {
         display: flex;
-        gap: 1.5rem;
+        gap: 1.25rem;
         flex-wrap: wrap;
-        margin-top: 0.5rem;
+        margin-top: 0.45rem;
     }
-    
+
     .rule-stat {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.8rem;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 0.75rem;
     }
-    
-    .rule-stat-label { color: #6b7280; }
-    .rule-stat-value { color: #d1d5db; font-weight: 500; }
-    
+
+    .rule-stat-label { color: var(--js-main-fg); }
+    .rule-stat-value { color: var(--js-main-fg); font-weight: 500; }
+    .rule-stat-value.positive { color: var(--js-pos); }
+    .rule-stat-value.negative { color: var(--js-neg); }
+
     .edge-score {
-        font-family: 'Space Grotesk', sans-serif;
-        font-size: 1.5rem;
-        font-weight: 700;
-        color: #f59e0b;
-    }
-    
-    .section-title {
-        font-family: 'Space Grotesk', sans-serif;
-        font-size: 1.5rem;
+        font-family: "IBM Plex Sans", system-ui, sans-serif;
+        font-size: 1.25rem;
         font-weight: 600;
-        color: #f3f4f6;
-        border-bottom: 2px solid #3b82f6;
-        padding-bottom: 0.5rem;
-        margin: 2rem 0 1rem 0;
+        color: var(--js-accent);
     }
-    
+
+    .section-title {
+        font-family: "IBM Plex Sans", system-ui, sans-serif;
+        font-size: 1.05rem;
+        font-weight: 600;
+        color: var(--js-main-fg);
+        letter-spacing: -0.02em;
+        border-bottom: 1px solid var(--js-border);
+        padding-bottom: 0.35rem;
+        margin: 1.75rem 0 0.75rem 0;
+    }
+
     .improvement-badge {
         display: inline-block;
-        padding: 0.25rem 0.75rem;
-        border-radius: 9999px;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.875rem;
+        padding: 0.15rem 0.5rem;
+        border-radius: 2px;
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 0.75rem;
         font-weight: 600;
+        margin-left: 0.35rem;
     }
-    
+
     .improvement-badge.positive {
-        background: rgba(16, 185, 129, 0.2);
-        color: #10b981;
-        border: 1px solid rgba(16, 185, 129, 0.3);
+        background: rgba(77, 155, 115, 0.12);
+        color: var(--js-pos);
+        border: 1px solid rgba(77, 155, 115, 0.35);
     }
-    
+
     .improvement-badge.negative {
-        background: rgba(239, 68, 68, 0.2);
-        color: #ef4444;
-        border: 1px solid rgba(239, 68, 68, 0.3);
+        background: rgba(185, 85, 80, 0.12);
+        color: var(--js-neg);
+        border: 1px solid rgba(185, 85, 80, 0.35);
     }
-    
-    /* Sidebar styling */
-    .css-1d391kg, [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #111827 0%, #0a0e17 100%);
-    }
-    
-    /* Button styling */
-    .stButton > button {
-        font-family: 'Space Grotesk', sans-serif;
-        background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
-        color: white;
-        border: none;
-        border-radius: 8px;
-        padding: 0.75rem 1.5rem;
-        font-weight: 600;
-        transition: all 0.2s ease;
-    }
-    
-    .stButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 4px 20px rgba(59, 130, 246, 0.4);
-    }
-    
-    /* Info box */
+
     .info-box {
-        background: linear-gradient(145deg, rgba(59, 130, 246, 0.1) 0%, rgba(139, 92, 246, 0.1) 100%);
-        border: 1px solid rgba(59, 130, 246, 0.3);
-        border-radius: 12px;
-        padding: 1rem 1.25rem;
-        margin: 1rem 0;
+        background-color: var(--js-card);
+        border: 1px solid var(--js-border);
+        border-left: 3px solid var(--js-accent);
+        border-radius: 2px;
+        padding: 0.9rem 1rem;
+        margin: 0.75rem 0;
     }
-    
+
     .info-box p {
-        color: #d1d5db;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.875rem;
+        color: var(--js-main-fg);
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 0.8125rem;
         margin: 0;
+        line-height: 1.55;
+    }
+
+    .stButton > button {
+        font-family: "IBM Plex Sans", system-ui, sans-serif;
+        background-color: var(--js-card);
+        color: var(--js-text);
+        border: 1px solid var(--js-accent);
+        border-radius: 2px;
+        padding: 0.45rem 1rem;
+        font-weight: 500;
+    }
+
+    [data-testid="stMain"] .stButton > button {
+        color: var(--js-main-fg) !important;
+    }
+
+    .stButton > button:hover {
+        background-color: #5e5e5e;
+        border-color: var(--js-accent);
+        color: var(--js-text);
+    }
+
+    [data-testid="stMain"] .stButton > button:hover {
+        color: var(--js-main-fg) !important;
+    }
+
+    [data-testid="stMain"] [data-baseweb="tab-list"] {
+        background-color: var(--js-panel);
+        border-bottom: 1px solid var(--js-border);
+        gap: 0;
+    }
+
+    [data-testid="stMain"] [data-baseweb="tab"] {
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 0.8125rem;
+        color: #d0d0d0 !important;
+        border-radius: 0;
+    }
+
+    [data-testid="stMain"] [data-baseweb="tab"]:hover {
+        color: var(--js-main-fg) !important;
+    }
+
+    [data-testid="stMain"] [aria-selected="true"][data-baseweb="tab"] {
+        color: var(--js-accent) !important;
+        border-bottom: 2px solid var(--js-accent);
+    }
+
+    [data-testid="stMain"] .stMarkdown h3 {
+        font-family: "IBM Plex Sans", system-ui, sans-serif;
+        font-weight: 600;
+        font-size: 0.95rem;
+        color: var(--js-main-fg) !important;
+        letter-spacing: -0.02em;
+    }
+
+    [data-testid="stSidebar"] .stMarkdown h3 {
+        font-family: "IBM Plex Sans", system-ui, sans-serif;
+        font-weight: 600;
+        font-size: 0.95rem;
+        color: var(--js-text) !important;
+        letter-spacing: -0.02em;
+    }
+
+    div[data-testid="stMetric"] label {
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-size: 0.6875rem !important;
+        color: var(--js-muted) !important;
+    }
+
+    div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
+        font-family: "IBM Plex Sans", system-ui, sans-serif;
+        color: var(--js-text);
+    }
+
+    [data-testid="stMain"] div[data-testid="stMetric"] label {
+        color: var(--js-main-fg) !important;
+    }
+
+    [data-testid="stMain"] div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
+        color: var(--js-main-fg) !important;
+    }
+
+    [data-testid="stMain"] [data-testid="stExpander"] summary,
+    [data-testid="stMain"] [data-testid="stExpander"] summary span,
+    [data-testid="stMain"] [data-testid="stExpander"] p,
+    [data-testid="stMain"] [data-testid="stExpander"] div {
+        color: var(--js-main-fg) !important;
     }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 
 def format_currency(value: float) -> str:
@@ -271,7 +662,7 @@ def render_metric_card(label: str, value: str, change: Optional[str] = None, pos
 
 def render_rule_card(rank: int, rule: RuleCandidate):
     """Render a styled rule card."""
-    dir_symbol = ">" if rule.direction == "above" else "<"
+    dir_symbol = "≥" if rule.direction == "above" else "<"
     pnl_class = "positive" if rule.pnl_improvement >= 0 else "negative"
     wr_class = "positive" if rule.win_rate_improvement >= 0 else "negative"
     
@@ -282,7 +673,7 @@ def render_rule_card(rank: int, rule: RuleCandidate):
                     <span class="rule-rank">#{rank}</span>
                     <div class="rule-expression">{rule.column} {dir_symbol} {rule.threshold:.4f}</div>
                 </div>
-                <div class="edge-score">{rule.edge_score:.2f}</div>
+                <div class="edge-score" title="Mean $/trade spread (better minus worse)">{rule.mean_profit_spread:.2f}</div>
             </div>
             <div class="rule-stats">
                 <div class="rule-stat">
@@ -320,9 +711,9 @@ def create_equity_curve(df: pd.DataFrame, pnl_column: str, title: str = "Equity 
         y=cumulative_pnl.values,
         mode='lines',
         name='Equity',
-        line=dict(color='#10b981', width=2),
+        line=dict(color=_JS_THEME["accent"], width=1.5),
         fill='tozeroy',
-        fillcolor='rgba(16, 185, 129, 0.1)'
+        fillcolor='rgba(210, 31, 45, 0.08)',
     ))
     
     # Running max (for drawdown visualization)
@@ -331,26 +722,27 @@ def create_equity_curve(df: pd.DataFrame, pnl_column: str, title: str = "Equity 
         x=list(range(len(running_max))),
         y=running_max.values,
         mode='lines',
-        name='High Water Mark',
-        line=dict(color='#3b82f6', width=1, dash='dot'),
-        opacity=0.7
+        name='High water',
+        line=dict(color=_JS_THEME["neutral"], width=1, dash='dot'),
+        opacity=0.85,
     ))
     
     fig.update_layout(
-        title=dict(text=title, font=dict(size=18, color='#f3f4f6')),
-        xaxis_title="Trade #",
-        yaxis_title="Cumulative P&L ($)",
-        template='plotly_dark',
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(17, 24, 39, 0.8)',
-        font=dict(family="JetBrains Mono", color='#9ca3af'),
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-        hovermode='x unified',
-        margin=dict(l=60, r=20, t=60, b=40)
+        **_plotly_chart_layout(
+            title=dict(
+                text=title,
+                font=dict(size=15, color=_JS_THEME["text"], family=_JS_THEME["font_mono"]),
+            ),
+            xaxis_title="Trade #",
+            yaxis_title="Cumulative P&L ($)",
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+            hovermode='x unified',
+            margin=dict(l=60, r=20, t=60, b=40),
+        )
     )
     
-    fig.update_xaxes(gridcolor='#374151', gridwidth=0.5)
-    fig.update_yaxes(gridcolor='#374151', gridwidth=0.5, tickformat='$,.0f')
+    fig.update_xaxes(gridcolor=_JS_THEME["grid"], gridwidth=0.5)
+    fig.update_yaxes(gridcolor=_JS_THEME["grid"], gridwidth=0.5, tickformat='$,.0f')
     
     return fig
 
@@ -365,45 +757,56 @@ def create_distribution_plot(df: pd.DataFrame, pnl_column: str) -> go.Figure:
     fig.add_trace(go.Histogram(
         x=pnl_values,
         nbinsx=50,
-        name='P&L Distribution',
-        marker_color='#3b82f6',
-        opacity=0.8
+        name='P&L distribution',
+        marker_color=_JS_THEME["accent"],
+        opacity=0.75
     ))
     
     # Add mean line
     mean_pnl = pnl_values.mean()
-    fig.add_vline(x=mean_pnl, line_dash="dash", line_color="#f59e0b",
+    fig.add_vline(x=mean_pnl, line_dash="dash", line_color=_JS_THEME["neutral"],
                   annotation_text=f"Mean: {format_currency(mean_pnl)}")
     
     # Add zero line
-    fig.add_vline(x=0, line_dash="solid", line_color="#ef4444", line_width=2)
+    fig.add_vline(x=0, line_dash="solid", line_color=_JS_THEME["negative"], line_width=1)
     
     fig.update_layout(
-        title=dict(text="P&L Distribution", font=dict(size=18, color='#f3f4f6')),
-        xaxis_title="P&L ($)",
-        yaxis_title="Count",
-        template='plotly_dark',
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(17, 24, 39, 0.8)',
-        font=dict(family="JetBrains Mono", color='#9ca3af'),
-        showlegend=False,
-        margin=dict(l=60, r=20, t=60, b=40)
+        **_plotly_chart_layout(
+            title=dict(
+                text="P&L distribution",
+                font=dict(size=15, color=_JS_THEME["text"], family=_JS_THEME["font_mono"]),
+            ),
+            xaxis_title="P&L ($)",
+            yaxis_title="Count",
+            showlegend=False,
+            margin=dict(l=60, r=20, t=60, b=40),
+        )
     )
     
-    fig.update_xaxes(gridcolor='#374151', gridwidth=0.5, tickformat='$,.0f')
-    fig.update_yaxes(gridcolor='#374151', gridwidth=0.5)
+    fig.update_xaxes(gridcolor=_JS_THEME["grid"], gridwidth=0.5, tickformat='$,.0f')
+    fig.update_yaxes(gridcolor=_JS_THEME["grid"], gridwidth=0.5)
     
     return fig
+
+
+def _heatmap_cell_text(val: object) -> str:
+    try:
+        fv = float(val)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(fv):
+        return "—"
+    return f"{fv:.1f}"
 
 
 def create_indicator_heatmap(rules: List[RuleCandidate], top_n: int = 15) -> go.Figure:
     """Create a heatmap showing indicator effectiveness."""
     top_rules = rules[:top_n]
     
-    indicators = [f"{r.column} {'>' if r.direction == 'above' else '<'} {r.threshold:.2f}" 
+    indicators = [f"{r.column} {'≥' if r.direction == 'above' else '<'} {r.threshold:.2f}" 
                   for r in top_rules]
     
-    metrics = ['PnL Improvement %', 'Win Rate Change', 'Edge Score', 'Trades Kept %']
+    metrics = ['PnL Improvement %', 'Win Rate Change', 'Mean $/trade spread', 'Trades Kept %']
     
     # Build the data matrix
     data = []
@@ -413,7 +816,7 @@ def create_indicator_heatmap(rules: List[RuleCandidate], top_n: int = 15) -> go.
         row = [
             rule.pnl_improvement_pct,
             rule.win_rate_improvement * 100,
-            rule.edge_score * 100,  # Scale for visibility
+            rule.mean_profit_spread,
             pct_kept
         ]
         data.append(row)
@@ -423,24 +826,25 @@ def create_indicator_heatmap(rules: List[RuleCandidate], top_n: int = 15) -> go.
         x=metrics,
         y=indicators,
         colorscale=[
-            [0, '#ef4444'],
-            [0.5, '#1f2937'],
-            [1, '#10b981']
+            [0, _JS_THEME["negative"]],
+            [0.5, "#505050"],
+            [1, _JS_THEME["positive"]],
         ],
-        text=[[f"{val:.1f}" for val in row] for row in data],
+        text=[[_heatmap_cell_text(val) for val in row] for row in data],
         texttemplate="%{text}",
-        textfont={"size": 10, "color": "white"},
+        textfont={"size": 10, "color": _JS_THEME["text"]},
         hoverongaps=False
     ))
     
     fig.update_layout(
-        title=dict(text="Rule Effectiveness Matrix", font=dict(size=18, color='#f3f4f6')),
-        template='plotly_dark',
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(17, 24, 39, 0.8)',
-        font=dict(family="JetBrains Mono", color='#9ca3af'),
-        height=max(400, len(indicators) * 35),
-        margin=dict(l=250, r=20, t=60, b=40)
+        **_plotly_chart_layout(
+            title=dict(
+                text="Rule effectiveness",
+                font=dict(size=15, color=_JS_THEME["text"], family=_JS_THEME["font_mono"]),
+            ),
+            height=max(400, len(indicators) * 35),
+            margin=dict(l=250, r=20, t=60, b=40),
+        )
     )
     
     return fig
@@ -464,7 +868,7 @@ def create_threshold_analysis_plot(
     results = []
     for thresh in thresholds:
         if direction == 'above':
-            mask = col_values > thresh
+            mask = col_values >= thresh
         else:
             mask = col_values < thresh
         
@@ -495,7 +899,7 @@ def create_threshold_analysis_plot(
     fig.add_trace(go.Scatter(
         x=results_df['threshold'], y=results_df['total_pnl'],
         mode='lines+markers', name='Total P&L',
-        line=dict(color='#10b981', width=2),
+        line=dict(color=_JS_THEME["accent"], width=1.5),
         marker=dict(size=4)
     ), row=1, col=1)
     
@@ -503,7 +907,7 @@ def create_threshold_analysis_plot(
     fig.add_trace(go.Scatter(
         x=results_df['threshold'], y=results_df['win_rate'],
         mode='lines+markers', name='Win Rate',
-        line=dict(color='#3b82f6', width=2),
+        line=dict(color=_JS_THEME["positive"], width=1.5),
         marker=dict(size=4)
     ), row=1, col=2)
     
@@ -511,7 +915,7 @@ def create_threshold_analysis_plot(
     fig.add_trace(go.Scatter(
         x=results_df['threshold'], y=results_df['n_trades'],
         mode='lines+markers', name='Trades',
-        line=dict(color='#f59e0b', width=2),
+        line=dict(color=_JS_THEME["neutral"], width=1.5),
         marker=dict(size=4)
     ), row=2, col=1)
     
@@ -519,50 +923,54 @@ def create_threshold_analysis_plot(
     fig.add_trace(go.Scatter(
         x=results_df['threshold'], y=results_df['avg_pnl'],
         mode='lines+markers', name='Avg P&L',
-        line=dict(color='#8b5cf6', width=2),
+        line=dict(color=_JS_THEME["negative"], width=1.5),
         marker=dict(size=4)
     ), row=2, col=2)
     
     fig.update_layout(
-        title=dict(
-            text=f"Threshold Analysis: {column} ({direction})",
-            font=dict(size=18, color='#f3f4f6')
-        ),
-        template='plotly_dark',
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(17, 24, 39, 0.8)',
-        font=dict(family="JetBrains Mono", color='#9ca3af'),
-        showlegend=False,
-        height=500,
-        margin=dict(l=60, r=20, t=80, b=40)
+        **_plotly_chart_layout(
+            title=dict(
+                text=f"Threshold sweep: {column} ({direction})",
+                font=dict(size=15, color=_JS_THEME["text"], family=_JS_THEME["font_mono"]),
+            ),
+            showlegend=False,
+            height=500,
+            margin=dict(l=60, r=20, t=80, b=40),
+        )
     )
     
     # Update all axes
     for i in range(1, 3):
         for j in range(1, 3):
-            fig.update_xaxes(gridcolor='#374151', gridwidth=0.5, row=i, col=j)
-            fig.update_yaxes(gridcolor='#374151', gridwidth=0.5, row=i, col=j)
+            fig.update_xaxes(gridcolor=_JS_THEME["grid"], gridwidth=0.5, row=i, col=j)
+            fig.update_yaxes(gridcolor=_JS_THEME["grid"], gridwidth=0.5, row=i, col=j)
     
     return fig
 
 
 def main():
-    # Header
-    st.markdown('<h1 class="main-header">⚡ Strategy Cruncher</h1>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Optimize your backtest • Find the edge • Skip bad trades</p>', unsafe_allow_html=True)
+    # Header: partner wordmark only (no duplicate "FireEye" text)
+    if os.path.isfile(_FIREEYE_LOGO):
+        st.image(_FIREEYE_LOGO, width=320)
+    st.markdown('<hr class="fireeye-logo-rule" />', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="sub-header">Threshold discovery on backtest columns — '
+        "systematic filters, same spirit as Dave Mabe's crunch workflow.</p>",
+        unsafe_allow_html=True,
+    )
     
     # Sidebar
     with st.sidebar:
-        st.markdown("### 📁 Data Input")
+        st.markdown("### Data")
         
         uploaded_file = st.file_uploader(
-            "Upload Backtest CSV",
-            type=['csv'],
-            help="Upload your backtest results with indicator columns"
+            "Upload backtest (CSV or Excel)",
+            type=["csv", "xlsx", "xls"],
+            help="Upload your backtest results with indicator columns",
         )
         
         st.markdown("---")
-        st.markdown("### ⚙️ Settings")
+        st.markdown("### Parameters")
         
         pnl_column = st.text_input(
             "P&L Column Name",
@@ -576,37 +984,37 @@ def main():
             help="Apply rules iteratively: find best rule → apply → re-crunch until no more good rules"
         )
         
-        min_trades = st.slider(
-            "Min Trades After Filter",
-            min_value=10,
-            max_value=500,
-            value=300 if crunch_mode else 50,
-            help="Minimum trades required after applying a rule"
+        optimize_labels = [t[0] for t in OPTIMIZE_ON_OPTIONS]
+        optimize_metric_by_label = dict(OPTIMIZE_ON_OPTIONS)
+        optimize_label = st.selectbox(
+            "Optimize on",
+            options=optimize_labels,
+            index=0,
+            help=(
+                "Metric to maximize when searching for each filter rule. "
+                "Profit = total P&L; other options match common backtest stats."
+            ),
         )
+        optimize_metric = optimize_metric_by_label[optimize_label]
         
-        min_improvement = st.slider(
-            "Min P&L Improvement %",
-            min_value=0.0,
-            max_value=50.0,
-            value=8.0 if crunch_mode else 5.0,
-            step=1.0,
-            help="Minimum P&L improvement to consider a rule"
+        st.markdown("##### Aggression factor")
+        st.caption(
+            "Smallest filtered trade set as a percent of your backtest (1–49). "
+            "Default 33 → the optimizer only considers rules that leave at least that "
+            "fraction of trades (e.g. 1000 trades → at least 333). "
+            "Higher = larger minimum subset; lower = allow smaller subsets."
         )
-        
-        max_rules = st.slider(
-            "Max Rules (Crunch)",
+        # Single slider (avoids Streamlit slider+number_input key/state desync bugs)
+        aggression_pct = st.slider(
+            "Aggression factor (1–49% of backtest trades)",
             min_value=1,
-            max_value=15,
-            value=8,
-            help="Maximum rules to apply in Dave Mabe crunch mode"
-        ) if crunch_mode else 8
-        
-        n_thresholds = st.slider(
-            "Threshold Granularity",
-            min_value=20,
-            max_value=200,
-            value=100,
-            help="Number of threshold values to test per indicator"
+            max_value=49,
+            value=33,
+            key="aggression_pct",
+            help=(
+                "Minimum trades after each filter = this percent of total backtest rows "
+                "(Dave Mabe aggression factor)."
+            ),
         )
         
         analyze_library = st.checkbox(
@@ -621,12 +1029,20 @@ def main():
             help="Path to your column library Excel file",
             disabled=not analyze_library
         )
+
+        st.caption(
+            "Heavy analysis is **cached** for this upload and sidebar settings. "
+            "Switching tabs or report sort does not re-run it."
+        )
+        if st.button("Clear analysis cache", help="Re-run from scratch (e.g. after replacing the file)."):
+            _cached_fireeye_analysis.clear()
+            st.rerun()
         
         st.markdown("---")
-        st.markdown("### 📚 About")
+        st.markdown("### About")
         st.markdown("""
         <div class="info-box">
-            <p>Strategy Cruncher finds optimal indicator thresholds to filter bad trades from your backtest.</p>
+            <p>FireEye finds optimal indicator thresholds to filter bad trades from your backtest.</p>
             <br>
             <p><strong>Process:</strong></p>
             <p>1. Cast a wide net with initial backtest</p>
@@ -640,55 +1056,52 @@ def main():
     
     # Main content
     if uploaded_file is not None:
-        # Load data (CSV or Excel from backtest export)
         try:
             fname = getattr(uploaded_file, "name", "") or ""
-            if fname.lower().endswith((".xlsx", ".xls")):
-                df = pd.read_excel(uploaded_file, engine="openpyxl" if fname.lower().endswith(".xlsx") else None)
-            else:
-                df = pd.read_csv(uploaded_file)
-            
-            if pnl_column not in df.columns:
-                st.error(f"❌ Column '{pnl_column}' not found in data. Available columns: {list(df.columns)}")
-                return
-            
-            # Initialize cruncher
+            name_l = fname.lower()
+            mime = (getattr(uploaded_file, "type", "") or "").lower()
+            file_bytes = uploaded_file.getvalue()
+            lib_path = library_path.strip() if analyze_library else "column_library.xlsx"
+
+            (
+                df,
+                report_result,
+                crunch_rules,
+                filtered_df,
+                baseline_metrics,
+                final_metrics,
+            ) = _cached_fireeye_analysis(
+                file_bytes,
+                name_l,
+                mime,
+                pnl_column.strip(),
+                aggression_pct,
+                optimize_metric,
+                crunch_mode,
+                analyze_library,
+                lib_path,
+            )
+            df = df.copy()
+
+            n_trades_bt = len(df)
+            min_trades = min_trades_from_aggression(n_trades_bt, aggression_pct)
+
             cruncher = StrategyCruncher(
                 min_trades_remaining=min_trades,
-                min_improvement_pct=min_improvement,
-                n_threshold_bins=n_thresholds
+                min_improvement_pct=_DEFAULT_MIN_IMPROVEMENT_PCT,
+                n_threshold_bins=_DEFAULT_N_THRESHOLD_BINS,
+                optimize_metric=optimize_metric,
             )
-            
-            
-            # Run analysis
-            with st.spinner("Crunching..." if crunch_mode else "Analyzing backtest data..."):
-                if crunch_mode:
-                    crunch_rules, filtered_df, before_curve, after_curve = cruncher.crunch(
-                        df, pnl_column=pnl_column,
-                        target_metric="profit_factor",
-                        min_trades=min_trades,
-                        min_improvement_pct=min_improvement,
-                        max_rules=max_rules,
-                        verbose=False
-                    )
-                    baseline_metrics = cruncher._calculate_metrics(df, pnl_column)
-                    final_metrics = cruncher._calculate_metrics(filtered_df, pnl_column) if len(filtered_df) > 0 else baseline_metrics
-                    results = None
-                else:
-                    results = cruncher.analyze(
-                        df, 
-                        pnl_column=pnl_column,
-                        analyze_column_library=analyze_library,
-                        library_path=library_path if analyze_library else 'column_library.xlsx',
-                        max_rules=max_rules,
-                    )
-                    crunch_rules = None
-                    filtered_df = None
-                    baseline_metrics = None
-                    final_metrics = None
-            
-            # Store in session state
+
+            st.caption(
+                f"Aggression **{aggression_pct}%** → at least **{min_trades:,}** trades per filtered subset "
+                f"(backtest has **{n_trades_bt:,}** rows). Optimizing on **{optimize_label}**."
+            )
+
+            results = report_result
+
             st.session_state['results'] = results
+            st.session_state['report_result'] = report_result
             st.session_state['df'] = df
             st.session_state['pnl_column'] = pnl_column
             st.session_state['crunch_mode'] = crunch_mode
@@ -697,301 +1110,336 @@ def main():
             st.session_state['baseline_metrics'] = baseline_metrics
             st.session_state['final_metrics'] = final_metrics
             
-            if crunch_mode:
-                # Dave Mabe Crunch: Tabbed layout
-                baseline = baseline_metrics
-                tab1, tab2, tab3, tab4 = st.tabs(["Iterative Crunch", "Rules Table", "Equity Curves", "Raw Results"])
-                
-                with tab1:
-                    st.markdown(
-                        '<div class="section-title">Dave Mabe Crunch - Before vs After</div>',
-                        unsafe_allow_html=True,
-                    )
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        render_metric_card("Trades", f"{baseline['n_trades']:,} → {final_metrics['n_trades']:,}")
-                        render_metric_card("Profit Factor", f"{baseline['profit_factor']:.2f} → {final_metrics['profit_factor']:.2f}")
-                    with col2:
-                        render_metric_card(
-                            "Total P&L",
-                            format_currency(baseline['total_pnl']) + " → " + format_currency(final_metrics['total_pnl']),
-                            positive=final_metrics['total_pnl'] >= 0,
-                        )
-                        render_metric_card("Sharpe", f"{baseline['sharpe_ratio']:.2f} → {final_metrics['sharpe_ratio']:.2f}")
-                    with col3:
-                        render_metric_card("Win Rate", f"{baseline['win_rate']:.1%} → {final_metrics['win_rate']:.1%}")
-                        render_metric_card(
-                            "Max DD",
-                            format_currency(baseline['max_drawdown']) + " → " + format_currency(final_metrics['max_drawdown']),
-                        )
-                    with col4:
-                        render_metric_card("Rules", f"{len(crunch_rules)}")
-                    st.markdown("#### P&L Distribution (Before / After)")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.plotly_chart(create_distribution_plot(df, pnl_column), use_container_width=True, key="crunch_dist_before")
-                    with c2:
-                        st.plotly_chart(create_distribution_plot(filtered_df, pnl_column) if len(filtered_df) > 0 else create_distribution_plot(df, pnl_column), use_container_width=True, key="crunch_dist_after")
-                
-                with tab2:
-                    st.markdown('<div class="section-title">Rules Applied (Iterative)</div>', unsafe_allow_html=True)
-                    if crunch_rules:
-                        rules_table = pd.DataFrame(crunch_rules)
-                        display_cols = [
-                            'rule_num', 'column', 'direction', 'threshold',
-                            'new_metric', 'improvement_pct', 'trades_remaining',
+            tab_report, tab_iter, tab_extra = st.tabs(
+                ["Report", "Iterative crunch", "More analysis"]
+            )
+            
+            with tab_report:
+                st.caption(
+                    "Same report shape as [Dave Mabe’s sample report](https://app.davemabe.com/report/gxMbgmojHasQHUEz9M4t/): "
+                    "**Baseline**, then **Top columns** (suggested filters, most important first). "
+                    "Each suggestion: green/red equity curves, the rule, rank, and a **Better / Worse** metric table vs baseline. "
+                    "The hosted Strategy Cruncher adds a green **Filter** button to apply a rule and re-run optimization; "
+                    "here use the Python snippet or the **Iterative crunch** tab."
+                )
+                bl = report_result.baseline_metrics
+                st.markdown("### Baseline")
+                b1, b2, b3, b4, b5 = st.columns(5)
+                with b1:
+                    st.metric("Trades", f"{bl['n_trades']:,}")
+                with b2:
+                    st.metric("Total Profit", format_currency(bl["total_pnl"]))
+                with b3:
+                    st.metric("Profit Factor", _fmt_pf(bl["profit_factor"]))
+                with b4:
+                    st.metric("Win Percent", f"{bl['win_rate']:.1%}")
+                with b5:
+                    st.metric("Calmar", _fmt_calmar(bl["calmar_ratio"]))
+
+                pool = report_result.get_top_rules(10)
+                sort_by = st.radio(
+                    "Sort by",
+                    (
+                        "Rank (importance)",
+                        "Trades (Better)",
+                        "Calmar (Better)",
+                        "Mean Profit (Better)",
+                        "Total Profit (Better)",
+                    ),
+                    horizontal=True,
+                    key="report_sort_by",
+                    help="Same dimensions as the cloud report: rank, size of kept set, Calmar on kept trades, expectancy, total P&L on kept trades.",
+                )
+                st.markdown(f"### Top columns ({len(pool)})")
+                st.caption(
+                    "Suggestions are ordered by importance (mean $/trade spread); **start at the top**. "
+                    "Green curve = cumulative P&L for trades that **pass** the rule; red = cumulative P&L for trades **removed**."
+                )
+                st.markdown("#### Report metrics (Dave Mabe definitions)")
+                st.caption(
+                    "[Report metrics glossary](https://app.davemabe.com/docs/report-metrics): **≥** / **<**, total profit improvement ($), "
+                    "curve quality improvement, better/worse trade counts."
+                )
+                _rm_pool = list(pool)
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Column": r.column,
+                                "Comparison": "≥" if r.direction == "above" else "<",
+                                "Value": r.threshold,
+                                "Rank": i + 1,
+                                "Total profit improvement": format_currency(r.pnl_improvement),
+                                "Curve quality improvement": round(r.curve_quality_improvement, 4),
+                                "Better trades": r.trades_remaining,
+                                "Worse trades": r.trades_filtered,
+                            }
+                            for i, r in enumerate(_rm_pool)
                         ]
-                        st.dataframe(
-                            rules_table[[c for c in display_cols if c in rules_table.columns]],
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                ranked = list(enumerate(pool, start=1))
+                if sort_by == "Rank (importance)":
+                    display_order = sorted(ranked, key=lambda x: x[0])
+                elif sort_by == "Trades (Better)":
+                    display_order = sorted(
+                        ranked, key=lambda x: x[1].trades_remaining, reverse=True
+                    )
+                elif sort_by == "Calmar (Better)":
+                    display_order = sorted(
+                        ranked, key=lambda x: rule_calmar_from_candidate(x[1]), reverse=True
+                    )
+                elif sort_by == "Mean Profit (Better)":
+                    display_order = sorted(ranked, key=lambda x: x[1].expectancy, reverse=True)
+                elif sort_by == "Total Profit (Better)":
+                    display_order = sorted(ranked, key=lambda x: x[1].total_pnl, reverse=True)
+                else:
+                    display_order = sorted(ranked, key=lambda x: x[0])
+                
+                if not pool:
+                    st.warning(
+                        "No column rules met the aggression and improvement thresholds. "
+                        "Try lowering aggression or the minimum improvement in code defaults."
+                    )
+                for _i, (importance_rank, rule) in enumerate(display_order):
+                    op_sym = "≥" if rule.direction == "above" else "<"
+                    exp = st.expander(
+                        f"**{rule.column}** — Rank #{importance_rank} — "
+                        f"Condition: {rule.column} {op_sym} {rule.threshold:.4f}",
+                        expanded=(importance_rank == 1 and sort_by.startswith("Rank")),
+                    )
+                    with exp:
+                        st.plotly_chart(
+                            create_better_worse_equity_figure(df, pnl_column, rule),
                             use_container_width=True,
-                            hide_index=True,
+                            key=f"bw_eq_{_i}",
                         )
-                        col_a, col_b, col_c = st.columns(3)
-                        with col_a:
-                            csv_buf = io.StringIO()
-                            filtered_df.to_csv(csv_buf, index=False)
-                            st.download_button(
-                                "Download Filtered Trades",
-                                data=csv_buf.getvalue(),
-                                file_name="crunch_filtered_trades.csv",
-                                mime="text/csv",
-                            )
-                        with col_b:
-                            rules_csv = io.StringIO()
-                            rules_table.to_csv(rules_csv, index=False)
-                            st.download_button(
-                                "Download Rules (CSV)",
-                                data=rules_csv.getvalue(),
-                                file_name="crunch_rules.csv",
-                                mime="text/csv",
-                            )
-                        with col_c:
-                            import json
-
-                            def _to_json(v):
-                                if isinstance(v, (np.floating, np.integer)):
-                                    return float(v)
-                                return v
-
-                            rules_json = json.dumps(
-                                [
-                                    {k: _to_json(v) for k, v in r.items() if k in display_cols}
-                                    for r in crunch_rules
+                        st.caption(
+                            "**Better** = trades that remain if you apply this rule; **Worse** = trades removed. "
+                            "**Trades** = count; **Total Profit** = sum of P&L; **Profit Factor** = gross profit ÷ gross loss (>1 ⇒ net winning); "
+                            "**Win Rate** = % winners; **Calmar** = total return vs max drawdown (higher is better). "
+                            "**Avg Profit / Trade** = expectancy on each side."
+                        )
+                        passes = rule_passes_series(df, rule)
+                        better_df = df[passes]
+                        worse_df = df[~passes]
+                        mb = cruncher._calculate_metrics(better_df, pnl_column)
+                        mw = cruncher._calculate_metrics(worse_df, pnl_column)
+                        cmp_tbl = pd.DataFrame(
+                            {
+                                "Metric": [
+                                    "Trades",
+                                    "Total Profit",
+                                    "Avg Profit / Trade",
+                                    "Profit Factor",
+                                    "Win Rate",
+                                    "Calmar",
                                 ],
-                                indent=2,
+                                "Better": [
+                                    f"{mb['n_trades']:,}",
+                                    format_currency(mb["total_pnl"]),
+                                    format_currency(mb["expectancy"]),
+                                    _fmt_pf(mb["profit_factor"]),
+                                    f"{mb['win_rate']:.1%}",
+                                    _fmt_calmar(mb["calmar_ratio"]),
+                                ],
+                                "Worse": [
+                                    f"{mw['n_trades']:,}",
+                                    format_currency(mw["total_pnl"]),
+                                    format_currency(mw["expectancy"]),
+                                    _fmt_pf(mw["profit_factor"]),
+                                    f"{mw['win_rate']:.1%}",
+                                    _fmt_calmar(mw["calmar_ratio"]),
+                                ],
+                            }
+                        )
+                        st.dataframe(cmp_tbl, use_container_width=True, hide_index=True)
+                        op = ">=" if rule.direction == "above" else "<"
+                        py_snippet = (
+                            f"mask = df['{rule.column}'] {op} {rule.threshold}\n"
+                            f"df_better = df[mask]\n"
+                            f"df_worse = df[~mask]"
+                        )
+                        st.caption(
+                            "Apply this filter in your platform or notebook (same idea as Dave Mabe's green Filter control). "
+                            "Rows with NaN in this column count as not passing the rule."
+                        )
+                        st.code(py_snippet, language="python")
+            
+            with tab_iter:
+                if crunch_mode:
+                    baseline = baseline_metrics
+                    tab1, tab2, tab3, tab4 = st.tabs(
+                        ["Iterative summary", "Rules table", "Equity curves", "Raw rows"]
+                    )
+                    
+                    with tab1:
+                        st.markdown(
+                            '<div class="section-title">Dave Mabe Crunch - Before vs After</div>',
+                            unsafe_allow_html=True,
+                        )
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            render_metric_card("Trades", f"{baseline['n_trades']:,} → {final_metrics['n_trades']:,}")
+                            render_metric_card("Profit Factor", f"{baseline['profit_factor']:.2f} → {final_metrics['profit_factor']:.2f}")
+                        with col2:
+                            render_metric_card(
+                                "Total P&L",
+                                format_currency(baseline['total_pnl']) + " → " + format_currency(final_metrics['total_pnl']),
+                                positive=final_metrics['total_pnl'] >= 0,
                             )
-                            st.download_button(
-                                "Download Rules (JSON)",
-                                data=rules_json,
-                                file_name="crunch_rules.json",
-                                mime="application/json",
+                            render_metric_card("Sharpe", f"{baseline['sharpe_ratio']:.2f} → {final_metrics['sharpe_ratio']:.2f}")
+                        with col3:
+                            render_metric_card("Win Rate", f"{baseline['win_rate']:.1%} → {final_metrics['win_rate']:.1%}")
+                            render_metric_card(
+                                "Max DD",
+                                format_currency(baseline['max_drawdown']) + " → " + format_currency(final_metrics['max_drawdown']),
                             )
-                    else:
-                        st.info("No rules met the criteria.")
-                
-                with tab3:
-                    st.markdown('<div class="section-title">Before vs After Equity Curve</div>', unsafe_allow_html=True)
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.plotly_chart(create_equity_curve(df, pnl_column, "Before (Baseline)"), use_container_width=True, key="crunch_equity_before")
-                    with col2:
-                        st.plotly_chart(create_equity_curve(filtered_df, pnl_column, "After (Filtered)") if len(filtered_df) > 0 else create_equity_curve(df, pnl_column, "After"), use_container_width=True, key="crunch_equity_after")
-                
-                with tab4:
-                    st.markdown('<div class="section-title">Raw Data Preview</div>', unsafe_allow_html=True)
-                    st.dataframe(df.head(500), use_container_width=True, hide_index=True)
-            else:
-                # Standard analyze mode
-                baseline = results.baseline_metrics
-                st.markdown('<div class="section-title">📊 Baseline Metrics</div>', unsafe_allow_html=True)
-                
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    render_metric_card("Total Trades", f"{baseline['n_trades']:,}")
-                    render_metric_card("Profit Factor", f"{baseline['profit_factor']:.2f}")
-                with col2:
-                    pnl_positive = baseline['total_pnl'] >= 0
-                    render_metric_card("Total P&L", format_currency(baseline['total_pnl']), positive=pnl_positive)
-                    render_metric_card("Sharpe Ratio", f"{baseline['sharpe_ratio']:.2f}")
-                with col3:
-                    render_metric_card("Win Rate", f"{baseline['win_rate']:.1%}")
-                    render_metric_card("Max Drawdown", format_currency(baseline['max_drawdown']))
-                with col4:
-                    render_metric_card("Avg Win", format_currency(baseline['avg_win']))
-                    render_metric_card("Avg Loss", format_currency(baseline['avg_loss']))
-                
-                st.markdown('<div class="section-title">📈 Equity Curve</div>', unsafe_allow_html=True)
+                        with col4:
+                            render_metric_card("Rules", f"{len(crunch_rules)}")
+                        st.markdown("#### P&L Distribution (Before / After)")
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.plotly_chart(create_distribution_plot(df, pnl_column), use_container_width=True, key="crunch_dist_before")
+                        with c2:
+                            st.plotly_chart(create_distribution_plot(filtered_df, pnl_column) if len(filtered_df) > 0 else create_distribution_plot(df, pnl_column), use_container_width=True, key="crunch_dist_after")
+                    
+                    with tab2:
+                        st.markdown('<div class="section-title">Rules Applied (Iterative)</div>', unsafe_allow_html=True)
+                        if crunch_rules:
+                            rules_table = pd.DataFrame(crunch_rules)
+                            display_cols = [
+                                'rule_num', 'column', 'direction', 'threshold',
+                                'new_metric', 'improvement_pct', 'trades_remaining',
+                            ]
+                            st.dataframe(
+                                rules_table[[c for c in display_cols if c in rules_table.columns]],
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                            col_a, col_b, col_c = st.columns(3)
+                            with col_a:
+                                csv_buf = io.StringIO()
+                                filtered_df.to_csv(csv_buf, index=False)
+                                st.download_button(
+                                    "Download Filtered Trades",
+                                    data=csv_buf.getvalue(),
+                                    file_name="crunch_filtered_trades.csv",
+                                    mime="text/csv",
+                                )
+                            with col_b:
+                                rules_csv = io.StringIO()
+                                rules_table.to_csv(rules_csv, index=False)
+                                st.download_button(
+                                    "Download Rules (CSV)",
+                                    data=rules_csv.getvalue(),
+                                    file_name="crunch_rules.csv",
+                                    mime="text/csv",
+                                )
+                            with col_c:
+                                import json
+
+                                def _to_json(v):
+                                    if isinstance(v, (np.floating, np.integer)):
+                                        return float(v)
+                                    return v
+
+                                rules_json = json.dumps(
+                                    [
+                                        {k: _to_json(v) for k, v in r.items() if k in display_cols}
+                                        for r in crunch_rules
+                                    ],
+                                    indent=2,
+                                )
+                                st.download_button(
+                                    "Download Rules (JSON)",
+                                    data=rules_json,
+                                    file_name="crunch_rules.json",
+                                    mime="application/json",
+                                )
+                        else:
+                            st.info("No rules met the criteria.")
+                    
+                    with tab3:
+                        st.markdown('<div class="section-title">Before vs After Equity Curve</div>', unsafe_allow_html=True)
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.plotly_chart(create_equity_curve(df, pnl_column, "Before (Baseline)"), use_container_width=True, key="crunch_equity_before")
+                        with col2:
+                            st.plotly_chart(create_equity_curve(filtered_df, pnl_column, "After (Filtered)") if len(filtered_df) > 0 else create_equity_curve(df, pnl_column, "After"), use_container_width=True, key="crunch_equity_after")
+                    
+                    with tab4:
+                        st.markdown('<div class="section-title">Raw Data Preview</div>', unsafe_allow_html=True)
+                        st.dataframe(df.head(500), use_container_width=True, hide_index=True)
+                else:
+                    st.info("Turn on **Dave Mabe Crunch Mode** in the sidebar to run iterative optimization here.")
+            
+            with tab_extra:
+                st.markdown("### Extra tools")
+                st.caption("Full baseline equity, distribution, rule cards, heatmap, and threshold plots.")
+                baseline = baseline_metrics
+                st.markdown('<div class="section-title">Baseline equity and distribution</div>', unsafe_allow_html=True)
                 col1, col2 = st.columns([2, 1])
                 with col1:
-                    fig_equity = create_equity_curve(df, pnl_column, "Baseline Equity Curve")
-                    st.plotly_chart(fig_equity, use_container_width=True, key="baseline_equity")
-                with col2:
-                    fig_dist = create_distribution_plot(df, pnl_column)
-                    st.plotly_chart(fig_dist, use_container_width=True, key="baseline_dist")
-                
-                st.markdown('<div class="section-title">🎯 Top Optimization Rules</div>', unsafe_allow_html=True)
-            
-            if not crunch_mode:
-                if not results.rules:
-                    st.warning("⚠️ No optimization rules found that meet the criteria. Try lowering the minimum improvement threshold.")
-                else:
-                    # Rules table
-                    top_rules = results.get_top_rules(20)
-                    
-                    col1, col2 = st.columns([2, 1])
-                    
-                    with col1:
-                        for i, rule in enumerate(top_rules[:10], 1):
-                            render_rule_card(i, rule)
-                    
-                    with col2:
-                        # Rule effectiveness heatmap
-                        fig_heatmap = create_indicator_heatmap(top_rules)
-                        st.plotly_chart(fig_heatmap, use_container_width=True, key="rules_heatmap")
-                    
-                    # Detailed Rule Analysis
-                    st.markdown('<div class="section-title">🔬 Deep Dive Analysis</div>', unsafe_allow_html=True)
-                    
-                    # Rule selector
-                    rule_options = [f"#{i+1}: {r.column} {'>' if r.direction == 'above' else '<'} {r.threshold:.4f}" 
-                                  for i, r in enumerate(top_rules)]
-                    
-                    selected_rule_idx = st.selectbox(
-                        "Select a rule to analyze in detail",
-                        range(len(rule_options)),
-                        format_func=lambda x: rule_options[x]
+                    st.plotly_chart(
+                        create_equity_curve(df, pnl_column, "Baseline equity"),
+                        use_container_width=True,
+                        key="baseline_equity_extra",
                     )
-                    
-                    selected_rule = top_rules[selected_rule_idx]
-                    
-                    col1, col2 = st.columns(2)
-                    
+                with col2:
+                    st.plotly_chart(
+                        create_distribution_plot(df, pnl_column),
+                        use_container_width=True,
+                        key="baseline_dist_extra",
+                    )
+                
+                st.markdown('<div class="section-title">Rule cards and heatmap</div>', unsafe_allow_html=True)
+                top_rules_extra = report_result.get_top_rules(20) if report_result.rules else []
+                if top_rules_extra:
+                    col1, col2 = st.columns([2, 1])
                     with col1:
-                        # Threshold analysis plot
+                        for i, rule in enumerate(top_rules_extra[:10], 1):
+                            render_rule_card(i, rule)
+                    with col2:
+                        fig_heatmap = create_indicator_heatmap(top_rules_extra)
+                        st.plotly_chart(fig_heatmap, use_container_width=True, key="rules_heatmap_extra")
+                    st.markdown('<div class="section-title">Threshold deep dive</div>', unsafe_allow_html=True)
+                    rule_options = [
+                        f"#{i+1}: {r.column} {'≥' if r.direction == 'above' else '<'} {r.threshold:.4f}"
+                        for i, r in enumerate(top_rules_extra)
+                    ]
+                    selected_rule_idx = st.selectbox(
+                        "Select a rule",
+                        range(len(rule_options)),
+                        format_func=lambda x: rule_options[x],
+                        key="extra_rule_select",
+                    )
+                    selected_rule = top_rules_extra[selected_rule_idx]
+                    c1, c2 = st.columns(2)
+                    with c1:
                         fig_thresh = create_threshold_analysis_plot(
                             df, selected_rule.column, pnl_column, selected_rule.direction
                         )
                         if fig_thresh:
-                            st.plotly_chart(fig_thresh, use_container_width=True, key="threshold_analysis")
-                    
-                    with col2:
-                        # Apply rule and show new equity curve
-                        if selected_rule.direction == 'above':
-                            filtered_df = df[df[selected_rule.column] > selected_rule.threshold]
+                            st.plotly_chart(fig_thresh, use_container_width=True, key="threshold_analysis_extra")
+                    with c2:
+                        if selected_rule.direction == "above":
+                            fdf = df[(df[selected_rule.column] >= selected_rule.threshold).fillna(False)]
                         else:
-                            filtered_df = df[df[selected_rule.column] < selected_rule.threshold]
-                        
-                        fig_filtered = create_equity_curve(
-                            filtered_df, pnl_column, 
-                            f"Equity Curve After Applying Rule"
+                            fdf = df[(df[selected_rule.column] < selected_rule.threshold).fillna(False)]
+                        st.plotly_chart(
+                            create_equity_curve(fdf, pnl_column, "Equity after rule"),
+                            use_container_width=True,
+                            key="rule_filtered_equity_extra",
                         )
-                        st.plotly_chart(fig_filtered, use_container_width=True, key="rule_filtered_equity")
-                    
-                    # Comparison metrics
-                    st.markdown("#### 📊 Before vs After Comparison")
-                    
-                    new_metrics = cruncher._calculate_metrics(filtered_df, pnl_column)
-                    
-                    comparison_data = {
-                        'Metric': ['Total Trades', 'Total P&L', 'Win Rate', 'Avg Win', 'Avg Loss', 
-                                  'Profit Factor', 'Sharpe Ratio', 'Expectancy'],
-                        'Before': [
-                            f"{baseline['n_trades']:,}",
-                            format_currency(baseline['total_pnl']),
-                            f"{baseline['win_rate']:.1%}",
-                            format_currency(baseline['avg_win']),
-                            format_currency(baseline['avg_loss']),
-                            f"{baseline['profit_factor']:.2f}",
-                            f"{baseline['sharpe_ratio']:.2f}",
-                            format_currency(baseline['expectancy'])
-                        ],
-                        'After': [
-                            f"{new_metrics['n_trades']:,}",
-                            format_currency(new_metrics['total_pnl']),
-                            f"{new_metrics['win_rate']:.1%}",
-                            format_currency(new_metrics['avg_win']),
-                            format_currency(new_metrics['avg_loss']),
-                            f"{new_metrics['profit_factor']:.2f}",
-                            f"{new_metrics['sharpe_ratio']:.2f}",
-                            format_currency(new_metrics['expectancy'])
-                        ],
-                        'Change': [
-                            f"{new_metrics['n_trades'] - baseline['n_trades']:+,}",
-                            f"{((new_metrics['total_pnl'] - baseline['total_pnl']) / abs(baseline['total_pnl']) * 100) if baseline['total_pnl'] != 0 else 0:+.1f}%",
-                            f"{(new_metrics['win_rate'] - baseline['win_rate']) * 100:+.1f}pp",
-                            f"{((new_metrics['avg_win'] - baseline['avg_win']) / baseline['avg_win'] * 100) if baseline['avg_win'] != 0 else 0:+.1f}%",
-                            f"{((new_metrics['avg_loss'] - baseline['avg_loss']) / baseline['avg_loss'] * 100) if baseline['avg_loss'] != 0 else 0:+.1f}%",
-                            f"{new_metrics['profit_factor'] - baseline['profit_factor']:+.2f}",
-                            f"{new_metrics['sharpe_ratio'] - baseline['sharpe_ratio']:+.2f}",
-                            f"{((new_metrics['expectancy'] - baseline['expectancy']) / abs(baseline['expectancy']) * 100) if baseline['expectancy'] != 0 else 0:+.1f}%"
-                        ]
-                    }
-                    
-                    st.dataframe(
-                        pd.DataFrame(comparison_data),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                    
-                    # Download filtered data
-                    st.markdown("---")
-                    
-                    col1, col2, col3 = st.columns([1, 1, 1])
-                    
-                    with col1:
-                        # Download filtered trades
-                        csv_buffer = io.StringIO()
-                        filtered_df.to_csv(csv_buffer, index=False)
-                        st.download_button(
-                            label="📥 Download Filtered Trades",
-                            data=csv_buffer.getvalue(),
-                            file_name="filtered_trades.csv",
-                            mime="text/csv"
-                        )
-                    
-                    with col2:
-                        # Download all rules
-                        rules_data = []
-                        for i, r in enumerate(top_rules, 1):
-                            rules_data.append({
-                                'Rank': i,
-                                'Column': r.column,
-                                'Direction': r.direction,
-                                'Threshold': r.threshold,
-                                'Edge Score': r.edge_score,
-                                'Total PnL': r.total_pnl,
-                                'PnL Improvement %': r.pnl_improvement_pct,
-                                'Win Rate': r.win_rate,
-                                'Win Rate Change': r.win_rate_improvement,
-                                'Trades Remaining': r.trades_remaining,
-                                'Trades Filtered': r.trades_filtered,
-                                'Profit Factor': r.profit_factor,
-                                'Expectancy': r.expectancy
-                            })
-                        
-                        rules_df = pd.DataFrame(rules_data)
-                        rules_csv = io.StringIO()
-                        rules_df.to_csv(rules_csv, index=False)
-                        
-                        st.download_button(
-                            label="📥 Download All Rules",
-                            data=rules_csv.getvalue(),
-                            file_name="optimization_rules.csv",
-                            mime="text/csv"
-                        )
-                    
-                    with col3:
-                        # Generate rule code
-                        rule_code = f"""# Apply this rule to your backtest
-# Rule: {selected_rule.column} {'>' if selected_rule.direction == 'above' else '<'} {selected_rule.threshold}
-
-df_filtered = df[df['{selected_rule.column}'] {'>' if selected_rule.direction == 'above' else '<'} {selected_rule.threshold}]
-"""
-                        st.code(rule_code, language='python')
+                else:
+                    st.caption("No rules available for heatmap (check aggression thresholds).")
             
-            # Column Library Recommendations Section (standard mode only)
-            if not crunch_mode and results and results.column_recommendations:
-                st.markdown('<div class="section-title">📚 Column Library Recommendations</div>', unsafe_allow_html=True)
+            # Column Library Recommendations (from parallel analyze)
+            if report_result and report_result.column_recommendations:
+                st.markdown('<div class="section-title">Column library recommendations</div>', unsafe_allow_html=True)
                 
                 st.markdown("""
                 <div class="info-box">
@@ -1043,37 +1491,38 @@ df_filtered = df[df['{selected_rule.column}'] {'>' if selected_rule.direction ==
                 rec_df.to_csv(rec_csv_buffer, index=False)
                 
                 st.download_button(
-                    label="📥 Download Column Recommendations",
+                    label="Download column recommendations",
                     data=rec_csv_buffer.getvalue(),
                     file_name="column_recommendations.csv",
                     mime="text/csv"
                 )
         
         except Exception as e:
-            st.error(f"❌ Error processing file: {str(e)}")
+            st.error(f"Error processing file: {str(e)}")
             import traceback
-            st.code(traceback.format_exc())
+            tb = traceback.format_exc()
+            st.code(tb)
+            raise RuntimeError("FireEye processing failed — see traceback above.") from e
     
     else:
         # No file uploaded - show instructions
         st.markdown("""
         <div class="info-box" style="text-align: center; padding: 3rem;">
-            <h3 style="color: #f3f4f6; margin-bottom: 1rem;">👈 Upload a backtest CSV to get started</h3>
-            <p style="color: #9ca3af; max-width: 600px; margin: 0 auto;">
-                Your CSV should contain trade data with a P&L column and indicator columns.
-                The Strategy Cruncher will analyze each indicator to find optimal thresholds
-                that maximize your trading performance.
+            <h3 style="color: #ffffff; margin-bottom: 1rem; font-family: IBM Plex Sans, sans-serif; font-weight: 600; font-size: 1.1rem;">Upload a backtest file</h3>
+            <p style="color: #ffffff; max-width: 640px; margin: 0 auto;">
+                Trade-level rows with a P&L column plus numeric indicator columns.
+                The cruncher searches thresholds per column to surface filters that improve your chosen metric.
             </p>
             <br>
-            <p style="color: #6b7280;">
-                <strong>Expected columns:</strong> ticker, date, net_pnl (or your P&L column),
-                and any numeric indicator columns (gap_percent, arval, position_in_range, atr, etc.)
+            <p style="color: #ffffff;">
+                <strong style="color: #ffffff;">Typical columns:</strong> ticker, date, net_pnl (or your P&L field),
+                and indicators (e.g. gap_percent, atr, rsi).
             </p>
         </div>
         """, unsafe_allow_html=True)
         
         # Example data preview
-        st.markdown('<div class="section-title">📋 Example Data Format</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Example row format</div>', unsafe_allow_html=True)
         
         example_df = pd.DataFrame({
             'ticker': ['AAPL', 'TSLA', 'NVDA', 'AMD', 'MSFT'],
