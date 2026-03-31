@@ -16,6 +16,7 @@ dependencies = [
     "streamlit>=1.28.0",
     "plotly>=5.15.0",
     "openpyxl>=3.1.0",
+    "xlrd>=2.0.1",
 ]
 keywords = ["trading", "backtesting", "optimization", "quant", "streamlit"]
 classifiers = [
@@ -34,7 +35,7 @@ fireeye = "strategy_cruncher.run:main"
 packages = ["strategy_cruncher"]
 
 [tool.setuptools.package-data]
-strategy_cruncher = ["assets/*.png"]
+strategy_cruncher = ["assets/*.png", "assets/*.gif"]
 
 [project.urls]
 Homepage = "https://github.com/thanh-cyber/strategycruncher"
@@ -44,5 +45,5 @@ Repository = "https://github.com/thanh-cyber/strategycruncher"
 dev = ["pytest>=8.0"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "strategy_cruncher"]
 pythonpath = ["."]

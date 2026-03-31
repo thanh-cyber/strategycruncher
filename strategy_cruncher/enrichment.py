@@ -74,7 +74,8 @@ def enrich_backtest(
         # Log price (useful for wide price ranges)
         df['log_price'] = np.log10(prices.clip(lower=0.01))
         
-        # Price percentile within the dataset
+        # Full-sample rank (uses future rows in the frame — ok for exploratory enrichment only;
+        # for causal / backtest-style percentiles use time-sorted expanding ranks instead.
         df['price_percentile'] = prices.rank(pct=True)
     
     # Movement features

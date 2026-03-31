@@ -13,30 +13,51 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from typing import List, Optional
+import base64
 import io
 import sys
 import os
 import math
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
 
 # Package import (Streamlit may run app as a script; second attempt must fail loud if still broken)
 try:
     from .cruncher import StrategyCruncher, OptimizationResult, RuleCandidate
+    from .excel_io import read_excel_upload
 except ImportError as _e_rel:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     try:
         from strategy_cruncher.cruncher import StrategyCruncher, OptimizationResult, RuleCandidate
+        from strategy_cruncher.excel_io import read_excel_upload
     except ImportError as _e_abs:
         raise ImportError(
             "Cannot import strategy_cruncher. Install the package (pip install -e .) or run from the repo root."
         ) from _e_abs
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
-_FIREEYE_LOGO = os.path.join(_APP_DIR, "assets", "fireeye_logo.png")
+_BUNDLED_BANNER_IMAGE = os.path.join(_APP_DIR, "assets", "fireeye_banner.gif")
+_LEGACY_LOGO_PNG = os.path.join(_APP_DIR, "assets", "fireeye_logo.png")
+# Primary banner / favicon: user’s animated GIF (falls back to bundled asset).
+_USER_BANNER_GIF = r"C:\Users\johnn\dwhelper\Magnum Opus\Untitled (500 x 350 px) (1).gif"
+
+
+def _banner_image_path() -> str:
+    if os.path.isfile(_USER_BANNER_GIF):
+        return _USER_BANNER_GIF
+    if os.path.isfile(_BUNDLED_BANNER_IMAGE):
+        return _BUNDLED_BANNER_IMAGE
+    if os.path.isfile(_LEGACY_LOGO_PNG):
+        return _LEGACY_LOGO_PNG
+    return _USER_BANNER_GIF
 
 # Dave Mabe crunch defaults (sidebar focuses on Optimize on + aggression factor)
 _DEFAULT_MIN_IMPROVEMENT_PCT = 8.0
 _DEFAULT_MAX_RULES = 8
 _DEFAULT_N_THRESHOLD_BINS = 100
+# Report tab: Dave Mabe–style tile grid (wide layout)
+_REPORT_TOP_COLUMNS_GRID_COLS = 3
 
 # Display label -> StrategyCruncher.optimize_metric / crunch target_metric
 OPTIMIZE_ON_OPTIONS: list[tuple[str, str]] = [
@@ -47,34 +68,34 @@ OPTIMIZE_ON_OPTIONS: list[tuple[str, str]] = [
     ("Sharpe ratio", "sharpe_ratio"),
 ]
 
-# UI theme: FireEye brand (red/black) + institutional mono data
+# UI theme: white background, black text, FireEye red accent
 _JS_THEME: dict = {
-    "bg": "#4a4a4a",
-    "panel": "#3f3f3f",
-    "card": "#525252",
-    "border": "#666666",
-    "text": "#e8e8e5",
-    "muted": "#ffffff",
-    "dim": "#5c5c58",
+    "bg": "#ffffff",
+    "panel": "#f5f5f5",
+    "card": "#f0f0f0",
+    "border": "#d0d0d0",
+    "text": "#000000",
+    "muted": "#000000",
+    "dim": "#333333",
     "accent": "#d21f2d",
-    "positive": "#4d9b73",
-    "negative": "#b95550",
-    "neutral": "#9a9a96",
-    "plot_bg": "rgba(58, 58, 58, 0.95)",
-    "grid": "#6e6e6e",
+    "positive": "#2d6a4f",
+    "negative": "#9b2226",
+    "neutral": "#555555",
+    "plot_bg": "#fafafa",
+    "grid": "#dddddd",
     "font_mono": "IBM Plex Mono, monospace",
     "font_sans": "IBM Plex Sans, system-ui, sans-serif",
 }
 
 
 def _plotly_base_font() -> dict:
-    return dict(family=_JS_THEME["font_mono"], color=_JS_THEME["muted"])
+    return dict(family=_JS_THEME["font_mono"], color=_JS_THEME["text"])
 
 
 def _plotly_chart_layout(**extra) -> dict:
     base = dict(
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
+        template="plotly_white",
+        paper_bgcolor="rgba(255,255,255,0)",
         plot_bgcolor=_JS_THEME["plot_bg"],
         font=_plotly_base_font(),
     )
@@ -89,45 +110,138 @@ def min_trades_from_aggression(n_trades: int, aggression_pct: int) -> int:
 
 
 def _load_df_from_upload(file_bytes: bytes, fname_lower: str, mime_lower: str) -> pd.DataFrame:
-    """Parse uploaded bytes as CSV or Excel (same rules as previous inline loader)."""
-    bio = io.BytesIO(file_bytes)
+    """Parse uploaded bytes as CSV or Excel (.xlsx → openpyxl, .xls → xlrd)."""
     is_excel = fname_lower.endswith((".xlsx", ".xls")) or (
         "spreadsheetml" in mime_lower or "ms-excel" in mime_lower
     )
     if is_excel:
-        engine = (
-            "openpyxl"
-            if fname_lower.endswith(".xlsx") or "spreadsheetml.sheet" in mime_lower
-            else None
+        return read_excel_upload(file_bytes, fname_lower, mime_lower)
+    return pd.read_csv(io.BytesIO(file_bytes))
+
+
+def _demo_backtest_dataframe(n_rows: int = 320) -> pd.DataFrame:
+    """
+    Synthetic backtest for the in-app demo.
+
+    Tuned so Report » Top columns usually fills **10 cards** (Mabe-style): latent ``score``
+    drives ``net_pnl``, plus ``demo_signal_0``…``demo_signal_9`` as noisy views of that score
+    so many columns pass min-improvement + min-trades with default sidebar aggression.
+    """
+    rng = np.random.default_rng(42)
+    dates = pd.date_range("2024-01-02", periods=n_rows, freq="B")
+    score = rng.uniform(0.0, 1.0, n_rows)
+    net_pnl = (score - 0.48) * 420.0 + rng.normal(0.0, 22.0, n_rows)
+
+    entry_price = rng.uniform(45.0, 210.0, n_rows)
+    mins = 30 + (np.arange(n_rows) % 5) * 9
+    entry_time = [f"{9 + (i % 5)}:{int(m):02d}" for i, m in enumerate(mins)]
+
+    data = {
+        "ticker": [f"D{i:03d}" for i in range(n_rows)],
+        "date": dates.strftime("%Y-%m-%d"),
+        "entry_time": entry_time,
+        "entry_price": entry_price,
+        "net_pnl": net_pnl,
+    }
+    for k in range(10):
+        data[f"demo_signal_{k}"] = score * (1.06 + 0.035 * k) + rng.normal(
+            0.0, 0.07, n_rows
         )
-        return pd.read_excel(bio, engine=engine)
-    return pd.read_csv(bio)
+    data["gap_percent"] = (score - 0.5) * 6.0 + rng.normal(0.0, 1.2, n_rows)
+    data["rsi"] = 38.0 + score * 34.0 + rng.normal(0.0, 3.5, n_rows)
+    data["atr"] = rng.uniform(0.5, 4.5, n_rows)
+    data["arval"] = score * 2.2 + rng.normal(0.0, 0.35, n_rows)
+    data["position_in_range"] = np.clip(
+        score + rng.normal(0.0, 0.12, n_rows), 0.05, 0.95
+    )
+
+    return pd.DataFrame(data)
 
 
-@st.cache_data(show_spinner="Running FireEye analysis…")
-def _cached_fireeye_analysis(
+def _demo_backtest_excel_bytes() -> bytes:
+    buf = io.BytesIO()
+    _demo_backtest_dataframe().to_excel(buf, index=False, engine="openpyxl")
+    return buf.getvalue()
+
+
+def _demo_column_library_xlsx_path() -> str:
+    """
+    Minimal column-library workbook for demo recommendations.
+    Written once to the user temp dir (same shape as a real column_library.xlsx).
+    """
+    p = Path(tempfile.gettempdir()) / "fireeye_demo_column_library.xlsx"
+    if not p.is_file():
+        price = pd.DataFrame(
+            {
+                "Column Name": [
+                    "gap_percent",
+                    "position_in_range",
+                    "price_percentile",
+                    "distance_from_high",
+                ],
+                "Description": [
+                    "Open gap vs prior close",
+                    "Where price sits in range",
+                    "Entry price percentile vs history",
+                    "Distance from swing high",
+                ],
+            }
+        )
+        volume = pd.DataFrame(
+            {
+                "Column Name": ["relative_volume", "volume_surge", "obscure_volume_metric"],
+                "Description": [
+                    "Volume vs average",
+                    "Spike in volume",
+                    "Unmodeled volume idea",
+                ],
+            }
+        )
+        time_s = pd.DataFrame(
+            {
+                "Column Name": ["entry_hour", "minutes_since_open"],
+                "Description": ["Hour of entry", "Minutes after open"],
+            }
+        )
+        with pd.ExcelWriter(p, engine="openpyxl") as w:
+            price.to_excel(w, sheet_name="Price", index=False)
+            volume.to_excel(w, sheet_name="Volume", index=False)
+            time_s.to_excel(w, sheet_name="Time", index=False)
+    return str(p)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_loaded_df(
+    file_bytes: bytes,
+    fname_lower: str,
+    mime_lower: str,
+) -> pd.DataFrame:
+    """Load upload/demo bytes into a DataFrame (cached per file bytes + type hints)."""
+    return _load_df_from_upload(file_bytes, fname_lower, mime_lower)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_report_analysis(
     file_bytes: bytes,
     fname_lower: str,
     mime_lower: str,
     pnl_column: str,
     aggression_pct: int,
     optimize_metric: str,
-    crunch_mode: bool,
     analyze_library: bool,
     library_path: str,
 ):
     """
-    Run legacy report analyze + optional iterative crunch. Cached on file bytes and parameters
-    so changing tabs / sort widgets does not repeat this work.
+    Cached baseline + report-mode analysis (legacy top-column scan).
+    Returns (df, report_result, baseline_metrics, min_trades).
     """
-    df = _load_df_from_upload(file_bytes, fname_lower, mime_lower)
+    df = _cached_loaded_df(file_bytes, fname_lower, mime_lower)
     if len(df) == 0:
         raise ValueError("Uploaded file has no data rows.")
     if pnl_column not in df.columns:
         raise ValueError(
             f"Column '{pnl_column}' not found in data. Available columns: {list(df.columns)}"
         )
-
     n_trades_bt = len(df)
     min_trades = min_trades_from_aggression(n_trades_bt, aggression_pct)
     cruncher = StrategyCruncher(
@@ -144,34 +258,48 @@ def _cached_fireeye_analysis(
         analyze_column_library=analyze_library,
         library_path=library_path,
     )
-    if crunch_mode:
-        crunch_rules, filtered_df, _, _ = cruncher.crunch(
-            df,
-            pnl_column=pnl_column,
-            target_metric=cruncher.optimize_metric,
-            min_trades=min_trades,
-            min_improvement_pct=_DEFAULT_MIN_IMPROVEMENT_PCT,
-            max_rules=_DEFAULT_MAX_RULES,
-            verbose=False,
-        )
-        final_metrics = (
-            cruncher._calculate_metrics(filtered_df, pnl_column)
-            if len(filtered_df) > 0
-            else baseline_metrics
-        )
-    else:
-        crunch_rules = None
-        filtered_df = None
-        final_metrics = None
+    return df, report_result, baseline_metrics, min_trades
 
-    return (
-        df,
-        report_result,
-        crunch_rules,
-        filtered_df,
-        baseline_metrics,
-        final_metrics,
+
+@st.cache_data(show_spinner=False)
+def _cached_crunch_analysis(
+    file_bytes: bytes,
+    fname_lower: str,
+    mime_lower: str,
+    pnl_column: str,
+    aggression_pct: int,
+    optimize_metric: str,
+):
+    """Cached iterative crunch analysis. Returns (crunch_rules, filtered_df, final_metrics)."""
+    df = _cached_loaded_df(file_bytes, fname_lower, mime_lower)
+    if len(df) == 0:
+        raise ValueError("Uploaded file has no data rows.")
+    if pnl_column not in df.columns:
+        raise ValueError(
+            f"Column '{pnl_column}' not found in data. Available columns: {list(df.columns)}"
+        )
+    min_trades = min_trades_from_aggression(len(df), aggression_pct)
+    cruncher = StrategyCruncher(
+        min_trades_remaining=min_trades,
+        min_improvement_pct=_DEFAULT_MIN_IMPROVEMENT_PCT,
+        n_threshold_bins=_DEFAULT_N_THRESHOLD_BINS,
+        optimize_metric=optimize_metric,
     )
+    crunch_rules, filtered_df, _, _ = cruncher.crunch(
+        df,
+        pnl_column=pnl_column,
+        target_metric=cruncher.optimize_metric,
+        min_trades=min_trades,
+        min_improvement_pct=_DEFAULT_MIN_IMPROVEMENT_PCT,
+        max_rules=_DEFAULT_MAX_RULES,
+        verbose=False,
+    )
+    final_metrics = (
+        cruncher._calculate_metrics(filtered_df, pnl_column)
+        if len(filtered_df) > 0
+        else cruncher._calculate_metrics(df, pnl_column)
+    )
+    return crunch_rules, filtered_df, final_metrics
 
 
 def _equity_sort_columns(df: pd.DataFrame) -> List[str]:
@@ -196,7 +324,12 @@ def rule_calmar_from_candidate(rule: RuleCandidate) -> float:
 
 
 def create_better_worse_equity_figure(
-    df: pd.DataFrame, pnl_column: str, rule: RuleCandidate
+    df: pd.DataFrame,
+    pnl_column: str,
+    rule: RuleCandidate,
+    *,
+    compact: bool = False,
+    show_title: bool = True,
 ) -> go.Figure:
     """
     Green = cumulative P&L from trades that pass the rule (kept); red = cumulative from trades removed.
@@ -233,19 +366,30 @@ def create_better_worse_equity_figure(
             line=dict(color=_JS_THEME["negative"], width=1.5),
         )
     )
-    fig.update_layout(
-        **_plotly_chart_layout(
-            title=dict(
-                text=f"{rule.column} {sym} {rule.threshold:.4g}",
-                font=dict(size=15, color=_JS_THEME["text"], family=_JS_THEME["font_mono"]),
-            ),
-            xaxis_title="Trade index (time-sorted)" if sort_cols else "Trade index",
-            yaxis_title="Cumulative P&L ($)",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            hovermode="x unified",
-            margin=dict(l=60, r=20, t=60, b=40),
-        )
+    title_sz = 11 if compact else 15
+    margins = (
+        dict(l=48, r=12, t=36 if not show_title else 44, b=30)
+        if compact
+        else dict(l=60, r=20, t=60, b=40)
     )
+    leg = dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    if compact:
+        leg = {**leg, "font": dict(size=9)}
+    layout_kw = dict(
+        xaxis_title="Trade index (time-sorted)" if sort_cols else "Trade index",
+        yaxis_title="Cumulative P&L ($)",
+        legend=leg,
+        hovermode="x unified",
+        margin=margins,
+    )
+    if show_title:
+        layout_kw["title"] = dict(
+            text=f"{rule.column} {sym} {rule.threshold:.4g}",
+            font=dict(size=title_sz, color=_JS_THEME["text"], family=_JS_THEME["font_mono"]),
+        )
+    fig.update_layout(**_plotly_chart_layout(**layout_kw))
+    if compact:
+        fig.update_layout(height=260)
     fig.update_xaxes(gridcolor=_JS_THEME["grid"], gridwidth=0.5)
     fig.update_yaxes(gridcolor=_JS_THEME["grid"], gridwidth=0.5, tickformat="$,.0f")
     return fig
@@ -277,8 +421,8 @@ def _fmt_calmar(v) -> str:
     return f"{fv:.2f}"
 
 
-# Page configuration (browser tab uses FireEye logo when bundled asset is present)
-_page_icon = os.path.abspath(_FIREEYE_LOGO)
+# Page configuration (tab icon follows same resolution order as top banner)
+_page_icon = os.path.abspath(_banner_image_path())
 st.set_page_config(
     page_title="FireEye",
     page_icon=_page_icon if os.path.isfile(_page_icon) else "🔥",
@@ -286,32 +430,124 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Institutional quant desk styling (flat panels, mono data, single accent)
+# Light theme: white background, black typography, red accent
 st.markdown(
     """
 <style>
     @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
 
     :root {
-        --js-bg: #4a4a4a;
-        --js-panel: #3f3f3f;
-        --js-card: #525252;
-        --js-border: #666666;
+        --js-bg: #ffffff;
+        --js-panel: #f5f5f5;
+        --js-card: #f0f0f0;
+        --js-border: #d0d0d0;
         --js-accent: #d21f2d;
-        --js-text: #e8e8e5;
-        --js-main-fg: #ffffff;
-        --js-muted: #8c8c88;
-        --js-pos: #4d9b73;
-        --js-neg: #b95550;
+        --js-text: #000000;
+        --js-main-fg: #000000;
+        --js-muted: #000000;
+        --js-pos: #2d6a4f;
+        --js-neg: #9b2226;
     }
 
-    /* Default / sidebar: keep warm grey (not pure white) */
     html, body, .stApp {
         color: var(--js-text);
     }
 
     .stApp {
         background-color: var(--js-bg);
+    }
+
+    /* Streamlit’s default top decoration + full-width header row = extra “empty” banner — hide it */
+    [data-testid="stDecoration"] {
+        display: none !important;
+    }
+
+    /* Collapse native header strip; pin toolbar (⋮) top-right so it doesn’t reserve a second bar */
+    [data-testid="stHeader"] {
+        background-color: transparent !important;
+        border-bottom: none !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        position: fixed !important;
+        top: 0;
+        right: 0;
+        left: auto !important;
+        width: auto !important;
+        max-width: none !important;
+        z-index: 1003;
+        overflow: visible !important;
+        pointer-events: none;
+    }
+
+    [data-testid="stHeader"] * {
+        pointer-events: auto;
+    }
+
+    [data-testid="stToolbar"] {
+        position: fixed !important;
+        top: 0.35rem;
+        right: 0.5rem;
+        z-index: 1003;
+        background: var(--js-bg);
+        border-radius: 6px;
+    }
+
+    [data-testid="stHeader"] button,
+    [data-testid="stHeader"] span {
+        color: var(--js-main-fg) !important;
+    }
+
+    /* Centered wordmark: single top banner (logo + rule) */
+    .fireeye-floating-banner {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 1000;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: var(--js-bg);
+        padding: 0.45rem 1rem 0.35rem;
+        border-bottom: 1px solid var(--js-border);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+    }
+
+    .fireeye-banner-spacer {
+        min-height: clamp(5.5rem, 18vh, 10rem);
+        margin-bottom: 0.5rem;
+        pointer-events: none;
+    }
+
+    @media (min-width: 768px) {
+        .fireeye-banner-spacer {
+            min-height: clamp(6rem, 20vh, 11rem);
+        }
+    }
+
+    .fireeye-banner-logo {
+        display: block;
+        margin: 0 auto;
+        max-width: min(500px, 92vw);
+        max-height: min(350px, 22vh);
+        width: auto;
+        height: auto;
+        object-fit: contain;
+        /* Nudge right — optical center with Streamlit toolbar on the right */
+        transform: translateX(clamp(1rem, 2.5vw, 2.25rem));
+    }
+
+    .fireeye-floating-banner--text .fireeye-wordmark {
+        font-family: "IBM Plex Sans", system-ui, sans-serif;
+        font-size: 1.35rem;
+        font-weight: 700;
+        letter-spacing: -0.04em;
+        color: var(--js-text);
+        display: inline-block;
+        transform: translateX(clamp(1rem, 2.5vw, 2.25rem));
     }
 
     [data-testid="stSidebar"] {
@@ -338,14 +574,6 @@ st.markdown(
 
     [data-testid="stSidebar"] [data-testid="stCaption"] {
         color: var(--js-muted) !important;
-    }
-
-    /* Main content + top bar: all text white */
-    [data-testid="stHeader"],
-    [data-testid="stHeader"] span,
-    [data-testid="stHeader"] label,
-    [data-testid="stHeader"] button {
-        color: var(--js-main-fg) !important;
     }
 
     [data-testid="stMain"],
@@ -376,23 +604,6 @@ st.markdown(
         color: var(--js-main-fg) !important;
     }
 
-    [data-testid="stHeader"] {
-        background-color: transparent;
-        border-bottom: 1px solid var(--js-border);
-    }
-
-    [data-testid="stToolbar"] {
-        background: transparent;
-    }
-
-    hr.fireeye-logo-rule {
-        height: 0;
-        margin: 0.35rem 0 0.75rem 0;
-        max-width: 320px;
-        border: none;
-        border-top: 2px solid var(--js-accent);
-    }
-
     .sub-header {
         font-family: "IBM Plex Mono", ui-monospace, monospace;
         font-size: 0.8125rem;
@@ -401,11 +612,14 @@ st.markdown(
         text-align: left;
         margin: 0 0 1.5rem 0;
         line-height: 1.5;
+        border-left: 3px solid var(--js-accent);
+        padding-left: 0.65rem;
     }
 
     .metric-card {
         background-color: var(--js-card);
         border: 1px solid var(--js-border);
+        border-top: 2px solid rgba(210, 31, 45, 0.35);
         border-radius: 2px;
         padding: 0.9rem 1rem;
         margin: 0.5rem 0;
@@ -477,13 +691,27 @@ st.markdown(
         color: var(--js-accent);
     }
 
+    /* Report top-columns grid: tighter rule cards in tile cells */
+    .rule-card.report-tile-card {
+        margin: 0 0 0.5rem 0;
+        padding: 0.65rem 0.75rem;
+    }
+
+    .rule-card.report-tile-card .rule-expression {
+        font-size: 0.8125rem;
+    }
+
+    .rule-card.report-tile-card .edge-score {
+        font-size: 1.05rem;
+    }
+
     .section-title {
         font-family: "IBM Plex Sans", system-ui, sans-serif;
         font-size: 1.05rem;
         font-weight: 600;
         color: var(--js-main-fg);
         letter-spacing: -0.02em;
-        border-bottom: 1px solid var(--js-border);
+        border-bottom: 2px solid var(--js-accent);
         padding-bottom: 0.35rem;
         margin: 1.75rem 0 0.75rem 0;
     }
@@ -499,15 +727,15 @@ st.markdown(
     }
 
     .improvement-badge.positive {
-        background: rgba(77, 155, 115, 0.12);
+        background: rgba(45, 106, 79, 0.12);
         color: var(--js-pos);
-        border: 1px solid rgba(77, 155, 115, 0.35);
+        border: 1px solid rgba(45, 106, 79, 0.35);
     }
 
     .improvement-badge.negative {
-        background: rgba(185, 85, 80, 0.12);
+        background: rgba(155, 34, 38, 0.12);
         color: var(--js-neg);
-        border: 1px solid rgba(185, 85, 80, 0.35);
+        border: 1px solid rgba(155, 34, 38, 0.35);
     }
 
     .info-box {
@@ -542,7 +770,7 @@ st.markdown(
     }
 
     .stButton > button:hover {
-        background-color: #5e5e5e;
+        background-color: #e8e8e8;
         border-color: var(--js-accent);
         color: var(--js-text);
     }
@@ -553,19 +781,19 @@ st.markdown(
 
     [data-testid="stMain"] [data-baseweb="tab-list"] {
         background-color: var(--js-panel);
-        border-bottom: 1px solid var(--js-border);
+        border-bottom: 2px solid var(--js-accent);
         gap: 0;
     }
 
     [data-testid="stMain"] [data-baseweb="tab"] {
         font-family: "IBM Plex Mono", ui-monospace, monospace;
         font-size: 0.8125rem;
-        color: #d0d0d0 !important;
+        color: #000000 !important;
         border-radius: 0;
     }
 
     [data-testid="stMain"] [data-baseweb="tab"]:hover {
-        color: var(--js-main-fg) !important;
+        color: #000000 !important;
     }
 
     [data-testid="stMain"] [aria-selected="true"][data-baseweb="tab"] {
@@ -579,14 +807,29 @@ st.markdown(
         font-size: 0.95rem;
         color: var(--js-main-fg) !important;
         letter-spacing: -0.02em;
+        border-bottom: 2px solid var(--js-accent);
+        padding-bottom: 0.3rem;
+        margin-top: 0.25rem;
     }
 
     [data-testid="stSidebar"] .stMarkdown h3 {
         font-family: "IBM Plex Sans", system-ui, sans-serif;
         font-weight: 600;
         font-size: 0.95rem;
-        color: var(--js-text) !important;
+        color: var(--js-accent) !important;
         letter-spacing: -0.02em;
+        border-left: 3px solid var(--js-accent);
+        padding-left: 0.45rem;
+        margin-top: 0.15rem;
+    }
+
+    [data-testid="stMain"] .stMarkdown h4 {
+        font-family: "IBM Plex Sans", system-ui, sans-serif;
+        font-weight: 600;
+        font-size: 0.9rem;
+        color: var(--js-accent) !important;
+        letter-spacing: -0.02em;
+        margin-top: 0.5rem;
     }
 
     div[data-testid="stMetric"] label {
@@ -613,6 +856,58 @@ st.markdown(
     [data-testid="stMain"] [data-testid="stExpander"] p,
     [data-testid="stMain"] [data-testid="stExpander"] div {
         color: var(--js-main-fg) !important;
+    }
+
+    [data-testid="stCodeBlock"],
+    [data-testid="stCodeBlock"] pre,
+    [data-testid="stCodeBlock"] code {
+        color: #000000 !important;
+        background-color: #f5f5f5 !important;
+    }
+
+    [data-testid="stSidebar"] a,
+    [data-testid="stMain"] a {
+        color: var(--js-accent) !important;
+    }
+
+    [data-testid="stFileUploader"] section,
+    [data-testid="stFileUploader"] small,
+    [data-testid="stFileUploader"] label,
+    [data-testid="stFileUploader"] span {
+        color: #000000 !important;
+    }
+
+    [data-testid="stDataFrame"],
+    [data-testid="stDataFrame"] [data-testid="stTable"] {
+        color: #000000 !important;
+    }
+
+    [data-testid="stVerticalBlock"] > div [data-testid="stMarkdown"] a {
+        color: var(--js-accent) !important;
+    }
+
+    [data-testid="stSidebar"] hr {
+        margin: 0.75rem 0;
+        border: none;
+        border-top: 1px solid rgba(210, 31, 45, 0.35);
+    }
+
+    .accent-read {
+        color: var(--js-accent);
+        font-weight: 600;
+        font-family: "IBM Plex Sans", system-ui, sans-serif;
+    }
+
+    p.caption-hint {
+        font-size: 0.85rem;
+        color: #000000;
+        margin: 0 0 0.4rem 0;
+        line-height: 1.45;
+    }
+
+    p.caption-hint a {
+        color: var(--js-accent) !important;
+        font-weight: 500;
     }
 </style>
 """,
@@ -660,14 +955,15 @@ def render_metric_card(label: str, value: str, change: Optional[str] = None, pos
     """, unsafe_allow_html=True)
 
 
-def render_rule_card(rank: int, rule: RuleCandidate):
-    """Render a styled rule card."""
+def render_rule_card(rank: int, rule: RuleCandidate, *, card_class: str = ""):
+    """Render a styled rule card. Optional ``card_class`` for grid tiles (e.g. ``report-tile-card``)."""
     dir_symbol = "≥" if rule.direction == "above" else "<"
     pnl_class = "positive" if rule.pnl_improvement >= 0 else "negative"
     wr_class = "positive" if rule.win_rate_improvement >= 0 else "negative"
-    
+    extra = f" {card_class.strip()}" if card_class.strip() else ""
+
     st.markdown(f"""
-        <div class="rule-card">
+        <div class="rule-card{extra}">
             <div style="display: flex; justify-content: space-between; align-items: center;">
                 <div>
                     <span class="rule-rank">#{rank}</span>
@@ -764,11 +1060,21 @@ def create_distribution_plot(df: pd.DataFrame, pnl_column: str) -> go.Figure:
     
     # Add mean line
     mean_pnl = pnl_values.mean()
-    fig.add_vline(x=mean_pnl, line_dash="dash", line_color=_JS_THEME["neutral"],
-                  annotation_text=f"Mean: {format_currency(mean_pnl)}")
-    
-    # Add zero line
-    fig.add_vline(x=0, line_dash="solid", line_color=_JS_THEME["negative"], line_width=1)
+    fig.add_vline(
+        x=mean_pnl,
+        line_dash="dash",
+        line_color=_JS_THEME["neutral"],
+        annotation_text=f"Mean: {format_currency(mean_pnl)}",
+        annotation_font_color=_JS_THEME["text"],
+    )
+
+    fig.add_vline(
+        x=0,
+        line_dash="solid",
+        line_color=_JS_THEME["negative"],
+        line_width=1,
+        annotation_font_color=_JS_THEME["text"],
+    )
     
     fig.update_layout(
         **_plotly_chart_layout(
@@ -827,7 +1133,7 @@ def create_indicator_heatmap(rules: List[RuleCandidate], top_n: int = 15) -> go.
         y=indicators,
         colorscale=[
             [0, _JS_THEME["negative"]],
-            [0.5, "#505050"],
+            [0.5, "#e8e8e8"],
             [1, _JS_THEME["positive"]],
         ],
         text=[[_heatmap_cell_text(val) for val in row] for row in data],
@@ -948,11 +1254,62 @@ def create_threshold_analysis_plot(
     return fig
 
 
+@st.cache_data(show_spinner=False)
+def _banner_data_uri(logo_path: str) -> str:
+    """Build a data URI for banner image; cached to avoid re-encoding large GIFs every rerun."""
+    if os.path.isfile(logo_path):
+        ext = os.path.splitext(logo_path)[1].lower().lstrip(".")
+        if ext == "png":
+            mime = "png"
+        elif ext == "gif":
+            mime = "gif"
+        elif ext in ("jpg", "jpeg"):
+            mime = "jpeg"
+        else:
+            mime = "png"
+        with open(logo_path, "rb") as f:
+            b64 = base64.standard_b64encode(f.read()).decode("ascii")
+        return f"data:image/{mime};base64,{b64}"
+    return ""
+
+
+def _fireeye_top_banner_html(logo_path: str) -> str:
+    """HTML for centered top banner (logo base64-inlined for reliable fixed positioning)."""
+    src = _banner_data_uri(logo_path)
+    if src:
+        inner = f'<img src="{src}" alt="FireEye" class="fireeye-banner-logo" />'
+        extra = ""
+    else:
+        inner = '<span class="fireeye-wordmark">FireEye</span>'
+        extra = " fireeye-floating-banner--text"
+    return (
+        f'<div class="fireeye-floating-banner{extra}">{inner}</div>'
+        '<div class="fireeye-banner-spacer" aria-hidden="true"></div>'
+    )
+
+
+def _startup_diagnostic_text() -> str:
+    """Single block for terminal + UI so a run is obviously alive and versions are visible."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return "\n".join(
+        [
+            f"FireEye (Strategy Cruncher) · {ts} UTC",
+            f"streamlit {st.__version__} · pandas {pd.__version__} · numpy {np.__version__}",
+            f"app_dir: {_APP_DIR}",
+            f"cwd: {os.getcwd()}",
+            "imports: cruncher + excel_io OK",
+        ]
+    )
+
+
 def main():
-    # Header: partner wordmark only (no duplicate "FireEye" text)
-    if os.path.isfile(_FIREEYE_LOGO):
-        st.image(_FIREEYE_LOGO, width=320)
-    st.markdown('<hr class="fireeye-logo-rule" />', unsafe_allow_html=True)
+    _diag = _startup_diagnostic_text()
+    if "fireeye_startup_logged" not in st.session_state:
+        st.session_state["fireeye_startup_logged"] = True
+        print(_diag, flush=True)
+
+    # Header: centered partner wordmark + red rule; fixed below Streamlit chrome while scrolling
+    st.markdown(_fireeye_top_banner_html(_banner_image_path()), unsafe_allow_html=True)
     st.markdown(
         '<p class="sub-header">Threshold discovery on backtest columns — '
         "systematic filters, same spirit as Dave Mabe's crunch workflow.</p>",
@@ -961,14 +1318,32 @@ def main():
     
     # Sidebar
     with st.sidebar:
+        with st.expander("Startup test output", expanded=True):
+            st.code(_diag, language="text")
+
         st.markdown("### Data")
-        
+
         uploaded_file = st.file_uploader(
             "Upload backtest (CSV or Excel)",
             type=["csv", "xlsx", "xls"],
             help="Upload your backtest results with indicator columns",
         )
-        
+
+        demo_backtest = st.checkbox(
+            "Use built-in demo backtest (no file upload)",
+            value=False,
+            key="fireeye_demo_mode",
+            help=(
+                "Synthetic Excel in memory (~320 rows, tuned for 10 Report column cards) — same "
+                "Report / Crunch / recommendations UI as a real upload. A real file upload overrides this."
+            ),
+        )
+        if demo_backtest:
+            st.caption(
+                "Turn on **Analyze Column Library** to exercise the recommendations block "
+                "(demo uses a small auto-generated library in your temp folder)."
+            )
+
         st.markdown("---")
         st.markdown("### Parameters")
         
@@ -1035,7 +1410,9 @@ def main():
             "Switching tabs or report sort does not re-run it."
         )
         if st.button("Clear analysis cache", help="Re-run from scratch (e.g. after replacing the file)."):
-            _cached_fireeye_analysis.clear()
+            _cached_loaded_df.clear()
+            _cached_report_analysis.clear()
+            _cached_crunch_analysis.clear()
             st.rerun()
         
         st.markdown("---")
@@ -1054,37 +1431,87 @@ def main():
         </div>
         """, unsafe_allow_html=True)
     
-    # Main content
+    # Main content — real upload takes precedence over demo mode
+    _data_source: Optional[str] = None
     if uploaded_file is not None:
-        try:
-            fname = getattr(uploaded_file, "name", "") or ""
-            name_l = fname.lower()
-            mime = (getattr(uploaded_file, "type", "") or "").lower()
-            file_bytes = uploaded_file.getvalue()
-            lib_path = library_path.strip() if analyze_library else "column_library.xlsx"
+        _data_source = "upload"
+    elif demo_backtest:
+        _data_source = "demo"
 
+    if _data_source is not None:
+        progress = None
+        try:
+            if _data_source == "upload":
+                fname = getattr(uploaded_file, "name", "") or ""
+                name_l = fname.lower()
+                mime = (getattr(uploaded_file, "type", "") or "").lower()
+                file_bytes = uploaded_file.getvalue()
+            else:
+                name_l = "fireeye_demo_backtest.xlsx"
+                mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                file_bytes = _demo_backtest_excel_bytes()
+
+            lib_path = library_path.strip() if analyze_library else "column_library.xlsx"
+            if _data_source == "demo" and analyze_library:
+                lib_path = _demo_column_library_xlsx_path()
+
+            progress = st.progress(0, text="Starting FireEye analysis…")
+
+            progress.progress(15, text="Loading workbook…")
+            df = _cached_loaded_df(file_bytes, name_l, mime).copy()
+
+            progress.progress(45, text="Scanning columns and building report candidates…")
             (
-                df,
+                _df_report,
                 report_result,
-                crunch_rules,
-                filtered_df,
                 baseline_metrics,
-                final_metrics,
-            ) = _cached_fireeye_analysis(
+                min_trades,
+            ) = _cached_report_analysis(
                 file_bytes,
                 name_l,
                 mime,
                 pnl_column.strip(),
                 aggression_pct,
                 optimize_metric,
-                crunch_mode,
                 analyze_library,
                 lib_path,
             )
-            df = df.copy()
+            # keep a local mutable copy for downstream display operations
+            df = _df_report.copy()
+
+            if crunch_mode:
+                progress.progress(80, text="Running iterative crunch rules…")
+                (
+                    crunch_rules,
+                    filtered_df,
+                    final_metrics,
+                ) = _cached_crunch_analysis(
+                    file_bytes,
+                    name_l,
+                    mime,
+                    pnl_column.strip(),
+                    aggression_pct,
+                    optimize_metric,
+                )
+            else:
+                crunch_rules = None
+                filtered_df = None
+                final_metrics = None
+
+            progress.progress(100, text="Analysis complete.")
+            progress.empty()
+
+            if _data_source == "demo":
+                st.info(
+                    "**Demo backtest** — synthetic workbook in memory (~320 rows; expect **10** top column cards on Report). "
+                    + (
+                        "Recommendations use **fireeye_demo_column_library.xlsx** in your temp directory."
+                        if analyze_library
+                        else "Enable **Analyze Column Library** in the sidebar to see the recommendations layout."
+                    )
+                )
 
             n_trades_bt = len(df)
-            min_trades = min_trades_from_aggression(n_trades_bt, aggression_pct)
 
             cruncher = StrategyCruncher(
                 min_trades_remaining=min_trades,
@@ -1115,12 +1542,16 @@ def main():
             )
             
             with tab_report:
+                st.markdown(
+                    '<p class="caption-hint"><span class="accent-read">Read</span> '
+                    '<a href="https://app.davemabe.com/report/gxMbgmojHasQHUEz9M4t/" target="_blank" rel="noopener">Dave Mabe’s sample report</a> '
+                    "for the same layout idea.</p>",
+                    unsafe_allow_html=True,
+                )
                 st.caption(
-                    "Same report shape as [Dave Mabe’s sample report](https://app.davemabe.com/report/gxMbgmojHasQHUEz9M4t/): "
-                    "**Baseline**, then **Top columns** (suggested filters, most important first). "
-                    "Each suggestion: green/red equity curves, the rule, rank, and a **Better / Worse** metric table vs baseline. "
-                    "The hosted Strategy Cruncher adds a green **Filter** button to apply a rule and re-run optimization; "
-                    "here use the Python snippet or the **Iterative crunch** tab."
+                    "**Baseline**, then **Top columns** (filters, most important first). "
+                    "Each row: green/red equity curves, rule, rank, **Better / Worse** table vs baseline. "
+                    "Cloud Strategy Cruncher has a green **Filter** button; here use the Python snippet or **Iterative crunch**."
                 )
                 bl = report_result.baseline_metrics
                 st.markdown("### Baseline")
@@ -1153,12 +1584,15 @@ def main():
                 st.markdown(f"### Top columns ({len(pool)})")
                 st.caption(
                     "Suggestions are ordered by importance (mean $/trade spread); **start at the top**. "
-                    "Green curve = cumulative P&L for trades that **pass** the rule; red = cumulative P&L for trades **removed**."
+                    "Cards are shown in a **tile grid** (like Dave Mabe’s sample report). "
+                    "Green curve = cumulative P&L for trades that **pass** the rule; red = for trades **removed**."
                 )
                 st.markdown("#### Report metrics (Dave Mabe definitions)")
-                st.caption(
-                    "[Report metrics glossary](https://app.davemabe.com/docs/report-metrics): **≥** / **<**, total profit improvement ($), "
-                    "curve quality improvement, better/worse trade counts."
+                st.markdown(
+                    '<p class="caption-hint"><span class="accent-read">Read</span> the '
+                    '<a href="https://app.davemabe.com/docs/report-metrics" target="_blank" rel="noopener">report metrics glossary</a> '
+                    "for **≥** / **&lt;**, profit improvement, curve quality, better/worse counts.</p>",
+                    unsafe_allow_html=True,
                 )
                 _rm_pool = list(pool)
                 st.dataframe(
@@ -1203,73 +1637,101 @@ def main():
                         "No column rules met the aggression and improvement thresholds. "
                         "Try lowering aggression or the minimum improvement in code defaults."
                     )
-                for _i, (importance_rank, rule) in enumerate(display_order):
-                    op_sym = "≥" if rule.direction == "above" else "<"
-                    exp = st.expander(
-                        f"**{rule.column}** — Rank #{importance_rank} — "
-                        f"Condition: {rule.column} {op_sym} {rule.threshold:.4f}",
-                        expanded=(importance_rank == 1 and sort_by.startswith("Rank")),
-                    )
-                    with exp:
-                        st.plotly_chart(
-                            create_better_worse_equity_figure(df, pnl_column, rule),
-                            use_container_width=True,
-                            key=f"bw_eq_{_i}",
-                        )
-                        st.caption(
-                            "**Better** = trades that remain if you apply this rule; **Worse** = trades removed. "
-                            "**Trades** = count; **Total Profit** = sum of P&L; **Profit Factor** = gross profit ÷ gross loss (>1 ⇒ net winning); "
-                            "**Win Rate** = % winners; **Calmar** = total return vs max drawdown (higher is better). "
-                            "**Avg Profit / Trade** = expectancy on each side."
-                        )
-                        passes = rule_passes_series(df, rule)
-                        better_df = df[passes]
-                        worse_df = df[~passes]
-                        mb = cruncher._calculate_metrics(better_df, pnl_column)
-                        mw = cruncher._calculate_metrics(worse_df, pnl_column)
-                        cmp_tbl = pd.DataFrame(
-                            {
-                                "Metric": [
-                                    "Trades",
-                                    "Total Profit",
-                                    "Avg Profit / Trade",
-                                    "Profit Factor",
-                                    "Win Rate",
-                                    "Calmar",
-                                ],
-                                "Better": [
-                                    f"{mb['n_trades']:,}",
-                                    format_currency(mb["total_pnl"]),
-                                    format_currency(mb["expectancy"]),
-                                    _fmt_pf(mb["profit_factor"]),
-                                    f"{mb['win_rate']:.1%}",
-                                    _fmt_calmar(mb["calmar_ratio"]),
-                                ],
-                                "Worse": [
-                                    f"{mw['n_trades']:,}",
-                                    format_currency(mw["total_pnl"]),
-                                    format_currency(mw["expectancy"]),
-                                    _fmt_pf(mw["profit_factor"]),
-                                    f"{mw['win_rate']:.1%}",
-                                    _fmt_calmar(mw["calmar_ratio"]),
-                                ],
-                            }
-                        )
-                        st.dataframe(cmp_tbl, use_container_width=True, hide_index=True)
-                        op = ">=" if rule.direction == "above" else "<"
-                        py_snippet = (
-                            f"mask = df['{rule.column}'] {op} {rule.threshold}\n"
-                            f"df_better = df[mask]\n"
-                            f"df_worse = df[~mask]"
-                        )
-                        st.caption(
-                            "Apply this filter in your platform or notebook (same idea as Dave Mabe's green Filter control). "
-                            "Rows with NaN in this column count as not passing the rule."
-                        )
-                        st.code(py_snippet, language="python")
+                else:
+                    tiles = list(enumerate(display_order))
+                    ncols = _REPORT_TOP_COLUMNS_GRID_COLS
+                    for row_start in range(0, len(tiles), ncols):
+                        row = tiles[row_start : row_start + ncols]
+                        col_slots = st.columns(ncols)
+                        for slot, (tile_i, (importance_rank, rule)) in enumerate(row):
+                            with col_slots[slot]:
+                                try:
+                                    _tile_ctx = st.container(border=True)
+                                except TypeError:
+                                    _tile_ctx = st.container()
+                                with _tile_ctx:
+                                    render_rule_card(
+                                        importance_rank, rule, card_class="report-tile-card"
+                                    )
+                                    st.plotly_chart(
+                                        create_better_worse_equity_figure(
+                                            df,
+                                            pnl_column,
+                                            rule,
+                                            compact=True,
+                                            show_title=True,
+                                        ),
+                                        use_container_width=True,
+                                        key=f"bw_eq_{tile_i}",
+                                    )
+                                    exp_label = (
+                                        f"Better / Worse & code — {rule.column} "
+                                        f"({'≥' if rule.direction == 'above' else '<'} {rule.threshold:.4g})"
+                                    )
+                                    with st.expander(exp_label, expanded=False):
+                                        st.caption(
+                                            "**Better** = trades that remain if you apply this rule; **Worse** = trades removed. "
+                                            "**Trades** = count; **Total Profit** = sum of P&L; **Profit Factor** = gross profit ÷ gross loss (>1 ⇒ net winning); "
+                                            "**Win Rate** = % winners; **Calmar** = total return vs max drawdown (higher is better). "
+                                            "**Avg Profit / Trade** = expectancy on each side."
+                                        )
+                                        passes = rule_passes_series(df, rule)
+                                        better_df = df[passes]
+                                        worse_df = df[~passes]
+                                        mb = cruncher._calculate_metrics(better_df, pnl_column)
+                                        mw = cruncher._calculate_metrics(worse_df, pnl_column)
+                                        cmp_tbl = pd.DataFrame(
+                                            {
+                                                "Metric": [
+                                                    "Trades",
+                                                    "Total Profit",
+                                                    "Avg Profit / Trade",
+                                                    "Profit Factor",
+                                                    "Win Rate",
+                                                    "Calmar",
+                                                ],
+                                                "Better": [
+                                                    f"{mb['n_trades']:,}",
+                                                    format_currency(mb["total_pnl"]),
+                                                    format_currency(mb["expectancy"]),
+                                                    _fmt_pf(mb["profit_factor"]),
+                                                    f"{mb['win_rate']:.1%}",
+                                                    _fmt_calmar(mb["calmar_ratio"]),
+                                                ],
+                                                "Worse": [
+                                                    f"{mw['n_trades']:,}",
+                                                    format_currency(mw["total_pnl"]),
+                                                    format_currency(mw["expectancy"]),
+                                                    _fmt_pf(mw["profit_factor"]),
+                                                    f"{mw['win_rate']:.1%}",
+                                                    _fmt_calmar(mw["calmar_ratio"]),
+                                                ],
+                                            }
+                                        )
+                                        st.dataframe(
+                                            cmp_tbl,
+                                            use_container_width=True,
+                                            hide_index=True,
+                                        )
+                                        op = ">=" if rule.direction == "above" else "<"
+                                        py_snippet = (
+                                            f"mask = df['{rule.column}'] {op} {rule.threshold}\n"
+                                            f"df_better = df[mask]\n"
+                                            f"df_worse = df[~mask]"
+                                        )
+                                        st.caption(
+                                            "Apply this filter in your platform or notebook (same idea as Dave Mabe's green Filter control). "
+                                            "Rows with NaN in this column count as not passing the rule."
+                                        )
+                                        st.code(py_snippet, language="python")
             
             with tab_iter:
                 if crunch_mode:
+                    st.markdown(
+                        '<p class="caption-hint"><span class="accent-read">Read</span> — '
+                        "Rules apply in order; use the subtabs for summary, table, equity curves, and raw rows.</p>",
+                        unsafe_allow_html=True,
+                    )
                     baseline = baseline_metrics
                     tab1, tab2, tab3, tab4 = st.tabs(
                         ["Iterative summary", "Rules table", "Equity curves", "Raw rows"]
@@ -1378,7 +1840,12 @@ def main():
             
             with tab_extra:
                 st.markdown("### Extra tools")
-                st.caption("Full baseline equity, distribution, rule cards, heatmap, and threshold plots.")
+                st.markdown(
+                    '<p class="caption-hint"><span class="accent-read">Read</span> — '
+                    "Extra charts and heatmaps; same cached run as Report / Crunch.</p>",
+                    unsafe_allow_html=True,
+                )
+                st.caption("Baseline equity, distribution, rule cards, heatmap, and threshold plots.")
                 baseline = baseline_metrics
                 st.markdown('<div class="section-title">Baseline equity and distribution</div>', unsafe_allow_html=True)
                 col1, col2 = st.columns([2, 1])
@@ -1462,11 +1929,17 @@ def main():
                     
                     rec_data = []
                     for rec in recs:
+                        ps = rec.predictive_score
+                        ps_txt = (
+                            f"{ps:.3f}"
+                            if isinstance(ps, (int, float)) and math.isfinite(float(ps))
+                            else str(ps)
+                        )
                         rec_data.append({
                             'Column Name': rec.column_name,
                             'Description': rec.description,
-                            'Predictive Score': f"{rec.predictive_score:.3f}",
-                            'Status': '✓ Already Exists' if rec.calculation_method == 'Already exists' 
+                            'Predictive Score': ps_txt,
+                            'Status': '✓ Already Exists' if rec.calculation_method == 'Already exists'
                                      else ('✓ Can Calculate' if rec.can_calculate else '✗ Needs Data'),
                             'Method': rec.calculation_method or 'N/A'
                         })
@@ -1498,24 +1971,27 @@ def main():
                 )
         
         except Exception as e:
+            if progress is not None:
+                progress.empty()
             st.error(f"Error processing file: {str(e)}")
             import traceback
-            tb = traceback.format_exc()
-            st.code(tb)
-            raise RuntimeError("FireEye processing failed — see traceback above.") from e
+
+            st.code(traceback.format_exc())
+            st.stop()
     
     else:
         # No file uploaded - show instructions
         st.markdown("""
         <div class="info-box" style="text-align: center; padding: 3rem;">
-            <h3 style="color: #ffffff; margin-bottom: 1rem; font-family: IBM Plex Sans, sans-serif; font-weight: 600; font-size: 1.1rem;">Upload a backtest file</h3>
-            <p style="color: #ffffff; max-width: 640px; margin: 0 auto;">
-                Trade-level rows with a P&L column plus numeric indicator columns.
-                The cruncher searches thresholds per column to surface filters that improve your chosen metric.
+            <h3 style="color: #000000; margin-bottom: 1rem; font-family: IBM Plex Sans, sans-serif; font-weight: 600; font-size: 1.1rem;">Upload a backtest file — or use the demo</h3>
+            <p style="color: #000000; max-width: 640px; margin: 0 auto;">
+                In the sidebar, enable <strong>Use built-in demo backtest</strong> to preview the full Report, crunch, and
+                (optional) column library output without an Excel file.
+                Or upload trade-level rows with a P&amp;L column plus numeric indicators — the cruncher searches thresholds per column.
             </p>
             <br>
-            <p style="color: #ffffff;">
-                <strong style="color: #ffffff;">Typical columns:</strong> ticker, date, net_pnl (or your P&L field),
+            <p style="color: #000000;">
+                <strong style="color: #000000;">Typical columns:</strong> ticker, date, net_pnl (or your P&L field),
                 and indicators (e.g. gap_percent, atr, rsi).
             </p>
         </div>

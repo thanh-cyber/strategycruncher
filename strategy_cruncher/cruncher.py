@@ -264,16 +264,18 @@ class StrategyCruncher:
     # CONTINUOUS_COLUMN_PREFIX): apply_entry_columns writes Entry_Col_{Col_*}, apply_exit_columns
     # writes Exit_Col_{Col_*}, continuous tracking writes Continuous_Col_{base}_{Entry|Exit|Max|Min|At30min|At60min}.
 
-    def _detect_entry_columns(self, df: pd.DataFrame) -> List[str]:
+    def _detect_entry_columns(
+        self, df: pd.DataFrame, pnl_column: Optional[str] = None
+    ) -> List[str]:
         """
         Auto-detect entry-only columns for entry crunch.
-        Accepts: Entry_Col_* (backtestlibrary entry snapshots) and bare Col_* when present
-        (e.g. wide-format rows without the Entry_ prefix).
-        Rejects: Exit_Col_* (exit snapshots), Continuous_* / Cont_* (intra-trade paths), and
-        names matching forward-looking / exit-derived heuristics (MFE, MAE, Unrealized, etc.).
+        Primary: Entry_Col_* (backtestlibrary entry snapshots) and bare Col_* (wide export).
+        Fallback: if none match, any usable numeric column that is not exit/continuous and
+        not on the forward-looking heuristic list (typical CSVs: gap_percent, rsi, …). The
+        PnL column is never included when ``pnl_column`` is passed.
         """
         exit_substrings = self._get_entry_exclusion_terms()
-        entry_cols = []
+        entry_cols: List[str] = []
         for c in df.columns:
             if c.startswith("Cont_") or c.startswith("Continuous_"):
                 continue
@@ -282,6 +284,22 @@ class StrategyCruncher:
             is_entry_prefixed = c.startswith("Entry_Col_")
             is_bare_col = c.startswith("Col_") and not c.endswith("_Exit") and "_Exit" not in c
             if not (is_entry_prefixed or is_bare_col):
+                continue
+            if any(x.lower() in c.lower() for x in exit_substrings):
+                continue
+            if not self._is_usable_numeric_series(df[c]):
+                continue
+            entry_cols.append(c)
+        if entry_cols:
+            return entry_cols
+
+        skip_pnl = {pnl_column} if pnl_column else set()
+        for c in df.columns:
+            if c in skip_pnl:
+                continue
+            if c.startswith("Cont_") or c.startswith("Continuous_"):
+                continue
+            if c.startswith("Exit_"):
                 continue
             if any(x.lower() in c.lower() for x in exit_substrings):
                 continue
@@ -298,9 +316,8 @@ class StrategyCruncher:
             return
         raise ValueError(
             f"{where}: No usable entry-style columns found. "
-            "Expected columns like backtestlibrary exports: 'Entry_Col_*' (entry snapshot) "
-            "or bare 'Col_*' in wide format — not 'Exit_Col_*', not 'Continuous_Col_*', "
-            "not forward-looking exit metrics. "
+            "Expected backtestlibrary-style names ('Entry_Col_*' or 'Col_*'), or generic numeric "
+            "indicator columns (excluding Exit_/Continuous_, exit-derived heuristics, and the P&L column). "
             f"Columns in file: {list(df.columns)!r}"
         )
 
@@ -336,14 +353,14 @@ class StrategyCruncher:
             - after_curve: cumulative P&L of filtered trades (chronological when time cols present)
 
         Raises:
-            ValueError: If the frame has no usable Entry_Col_* / Col_* columns (lists all headers;
-                naming matches backtestlibrary ``columns.py``).
+            ValueError: If the frame has no usable entry-style columns (backtestlibrary names or
+                generic numeric indicators); lists all headers.
         """
         if pnl_column not in df.columns:
             raise ValueError(f"PnL column '{pnl_column}' not found. Available: {list(df.columns)}")
         
         # Auto-detect entry columns (no exit columns); no silent fallback
-        self.entry_columns = self._detect_entry_columns(df)
+        self.entry_columns = self._detect_entry_columns(df, pnl_column)
         self._require_entry_columns(df, "crunch()", self.entry_columns)
 
         current_df = df.copy()
@@ -374,8 +391,9 @@ class StrategyCruncher:
                     continue
                 thresholds = np.percentile(vals, np.arange(5, 96, 5))
                 for thresh in np.unique(thresholds):
-                    for direction in [">", "<"]:
-                        if direction == ">":
+                    # Match _find_optimal_thresholds / RuleCandidate: above = ge(thresh), below = lt(thresh)
+                    for direction in ("above", "below"):
+                        if direction == "above":
                             mask = (current_df[col] >= thresh).fillna(False)
                         else:
                             mask = (current_df[col] < thresh).fillna(False)
@@ -413,7 +431,7 @@ class StrategyCruncher:
             prev_baseline = self._calculate_metrics(current_df, pnl_column)
             col = best_rule["column"]
             thresh = best_rule["threshold"]
-            if best_rule["direction"] == ">":
+            if best_rule["direction"] == "above":
                 current_df = current_df[(current_df[col] >= thresh).fillna(False)]
             else:
                 current_df = current_df[(current_df[col] < thresh).fillna(False)]
@@ -440,7 +458,7 @@ class StrategyCruncher:
             baseline = best_rule["new_metric"]
             
             if verbose:
-                dir_sym = best_rule['direction']
+                dir_sym = ">=" if best_rule["direction"] == "above" else "<"
                 mval = best_rule['new_metric']
                 imp = best_rule['improvement_pct']
                 n_tr = best_rule['trades_remaining']
@@ -471,7 +489,9 @@ class StrategyCruncher:
         """Load trade data from CSV or Excel (.xlsx, .xls). Use for backtest exports."""
         path_lower = path.lower()
         if path_lower.endswith((".xlsx", ".xls")):
-            return pd.read_excel(path, engine="openpyxl" if path_lower.endswith(".xlsx") else None)
+            from .excel_io import read_excel_path
+
+            return read_excel_path(path)
         return pd.read_csv(path)
 
     def _crunch_rules_to_rule_candidates(
@@ -484,7 +504,11 @@ class StrategyCruncher:
         """Convert crunch rule dicts to RuleCandidate objects (report metrics on full backtest)."""
         out = []
         for r in crunch_rules:
-            direction = "above" if r["direction"] == ">" else "below"
+            direction = r["direction"]
+            if direction not in ("above", "below"):
+                raise ValueError(
+                    f"Invalid crunch rule direction {direction!r} (expected 'above' or 'below')"
+                )
             qb, qw, qimprove = curve_quality_metrics_for_rule(
                 df, pnl_column, r["column"], direction, float(r["threshold"])
             )
@@ -545,8 +569,9 @@ class StrategyCruncher:
         Args:
             data: DataFrame or path to CSV file
             pnl_column: Name of the P&L column
-            indicator_columns: Columns to analyze; if None, uses entry-style columns only
-                (Entry_Col_* / Col_*). Raises ValueError if none are found—fix the file or pass an explicit list.
+            indicator_columns: Columns to analyze; if None, detects entry-style columns
+                (Entry_Col_* / Col_* first, then generic numeric indicators excluding PnL).
+                Raises ValueError if none are found—fix the file or pass an explicit list.
             exclude_columns: List of columns to exclude from analysis
             analyze_column_library: Whether to analyze column library for recommendations
             library_path: Path to column library Excel file
@@ -600,7 +625,7 @@ class StrategyCruncher:
 
         # Legacy single-pass mode (parallel top-column rules for reports)
         if indicator_columns is None:
-            indicator_columns = self._detect_entry_columns(df)
+            indicator_columns = self._detect_entry_columns(df, pnl_column)
             self._require_entry_columns(
                 df, "analyze(iterative=False)", indicator_columns
             )

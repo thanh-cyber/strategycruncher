@@ -6,7 +6,6 @@ most valuable to add to your backtest data for optimization.
 """
 
 import pandas as pd
-import numpy as np
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -54,8 +53,7 @@ class ColumnLibraryAnalyzer:
     Usage:
         analyzer = ColumnLibraryAnalyzer('column_library.xlsx')
         recommendations = analyzer.analyze(backtest_df, pnl_column='net_pnl')
-        
-        for rec in recommendations.get_top_recommendations(10):
+        for rec in recommendations[:10]:
             print(rec)
     """
     
@@ -72,11 +70,16 @@ class ColumnLibraryAnalyzer:
     
     def load_library(self) -> Dict[str, pd.DataFrame]:
         """Load the column library Excel file. Raises on missing file, bad sheets, or empty data."""
-        xl = pd.ExcelFile(self.library_path)
+        from .excel_io import excel_engine_for_path
+
+        engine = excel_engine_for_path(self.library_path)
+        xl = pd.ExcelFile(self.library_path, engine=engine)
         self.library_data = {}
 
         for sheet_name in xl.sheet_names:
-            df = pd.read_excel(self.library_path, sheet_name=sheet_name)
+            df = pd.read_excel(
+                self.library_path, sheet_name=sheet_name, engine=engine
+            )
 
             if 'Column Name' in df.columns:
                 col_col = 'Column Name'
@@ -180,37 +183,37 @@ class ColumnLibraryAnalyzer:
                 
                 elif test_calculated:
                     # Try to calculate the column
-                    calculated_col, method = self._try_calculate_column(
+                    calculated_col, detail = self._try_calculate_column(
                         backtest_df, col_name, category
                     )
-                    
+
                     if calculated_col is not None:
                         # Test the calculated column
                         test_df = backtest_df.copy()
                         test_df[col_name] = calculated_col
-                        
+
                         score = self._test_column_predictive_power(
                             test_df, col_name, pnl_column, baseline
                         )
-                        
+
                         recommendations.append(ColumnRecommendation(
                             column_name=col_name,
                             category=category,
                             description=description,
                             predictive_score=score,
                             can_calculate=True,
-                            calculation_method=method,
+                            calculation_method=detail,
                             sample_values=calculated_col.head(5).tolist() if len(calculated_col) > 0 else None
                         ))
                     else:
-                        # Can't calculate - still add with low score
+                        reason = detail or "Blocked: no derivable pattern for this library row"
                         recommendations.append(ColumnRecommendation(
                             column_name=col_name,
                             category=category,
                             description=description,
                             predictive_score=0.0,
                             can_calculate=False,
-                            calculation_method=None
+                            calculation_method=reason,
                         ))
         
         # Sort by predictive score
@@ -244,79 +247,123 @@ class ColumnLibraryAnalyzer:
         
         # Normalize score (edge scores can vary widely)
         # Combine edge score with improvement metrics
-        score = (
-            best_rule.edge_score * 0.4 +
-            min(best_rule.pnl_improvement_pct / 100, 1.0) * 0.3 +
-            min(best_rule.win_rate_improvement, 0.5) * 0.3
-        )
-        
-        return score
+        es = best_rule.edge_score
+        pip = best_rule.pnl_improvement_pct
+        wr = best_rule.win_rate_improvement
+        es_term = 0.0 if es != es else es
+        pnl_raw = min(pip / 100, 1.0)
+        pnl_term = 0.0 if pnl_raw != pnl_raw else pnl_raw
+        wr_raw = min(wr, 0.5)
+        wr_term = 0.0 if wr_raw != wr_raw else wr_raw
+        score = es_term * 0.4 + pnl_term * 0.3 + wr_term * 0.3
+        return 0.0 if score != score else score
     
+    def _entry_price_expanding_percentile(self, df: pd.DataFrame) -> pd.Series:
+        """Percentile of entry_price using expanding rank within time-sorted order (no future rows)."""
+        sort_cols = [
+            c
+            for c in ("date", "entry_date", "entry_time", "EntryTime")
+            if c in df.columns
+        ]
+        work = df.loc[:, ["entry_price"]].copy()
+        if sort_cols:
+            for c in sort_cols:
+                work[c] = df[c].values
+            work = work.sort_values(sort_cols, kind="mergesort")
+        ranked = work["entry_price"].expanding(min_periods=1).rank(pct=True)
+        aligned = pd.Series(ranked.values, index=work.index)
+        return aligned.reindex(df.index)
+
     def _try_calculate_column(
         self,
         df: pd.DataFrame,
         column_name: str,
         category: str
     ) -> Tuple[Optional[pd.Series], Optional[str]]:
-        """Try to calculate a column from available data."""
+        """
+        Return (series, method) on success; (None, 'Blocked: …') when inputs are missing or unsafe.
+        """
         col_lower = column_name.lower().replace(' ', '_').replace('-', '_')
-        
+        cat_lower = category.lower()
+
         # Volume-based calculations
-        if 'volume' in category.lower() or 'volume' in col_lower:
+        if 'volume' in cat_lower or 'volume' in col_lower:
             if 'arval' in col_lower or 'relative_volume' in col_lower:
-                if 'shares' in df.columns and 'entry_value' in df.columns:
-                    # Approximate: entry_value / shares gives price, can estimate volume
-                    return None, None  # Need actual volume data
-            
+                return (
+                    None,
+                    "Blocked: need volume (or bar volume) — cannot infer relative volume "
+                    "from entry_value/shares alone",
+                )
+
             if 'volume_surge' in col_lower:
-                return None, None  # Need volume data
-        
+                return None, "Blocked: need volume time series"
+            if "volume" in cat_lower:
+                return (
+                    None,
+                    "Blocked: no implemented volume derivation for this library row "
+                    "(expect relative_volume/arval or volume_surge in the column name)",
+                )
+
         # Price-based calculations
-        if 'price' in category.lower() or 'position' in col_lower:
+        if 'price' in cat_lower or 'position' in cat_lower:
             if 'position_in_range' in col_lower:
-                if 'entry_price' in df.columns:
-                    # Would need high/low of day - approximate with entry_price
-                    return None, None
-            
+                if 'entry_price' not in df.columns:
+                    return None, "Blocked: need entry_price"
+                return (
+                    None,
+                    "Blocked: need session or daily high/low (or bar range) — "
+                    "position_in_range is not derivable from price alone",
+                )
+
             if 'price_percentile' in col_lower:
-                if 'entry_price' in df.columns:
-                    return df['entry_price'].rank(pct=True), "entry_price.rank(pct=True)"
-            
+                if 'entry_price' not in df.columns:
+                    return None, "Blocked: need entry_price"
+                ser = self._entry_price_expanding_percentile(df)
+                return (
+                    ser,
+                    "entry_price expanding percentile (sorted by date/time columns when present)",
+                )
+
             if 'distance_from_high' in col_lower:
-                if 'entry_price' in df.columns:
-                    # Approximate: use max entry_price as proxy
-                    max_price = df['entry_price'].max()
-                    return (max_price - df['entry_price']) / max_price, "distance from max entry_price"
-        
+                return (
+                    None,
+                    "Blocked: need a causal reference high (e.g. prior-day or pre-entry high). "
+                    "A global max(entry_price) across the backtest leaks future information.",
+                )
+
         # Time-based calculations
-        if 'time' in category.lower() or 'hour' in col_lower:
+        if 'time' in cat_lower or 'hour' in col_lower:
             if 'entry_hour' in col_lower or 'entry_time' in col_lower:
-                if 'entry_time' in df.columns:
-                    return df['entry_time'].apply(_extract_hour), "extracted from entry_time"
-            
+                if 'entry_time' not in df.columns:
+                    return None, "Blocked: need entry_time"
+                return df['entry_time'].apply(_extract_hour), "extracted from entry_time"
+
             if 'minutes_since_open' in col_lower:
-                if 'entry_time' in df.columns:
-                    hours = df['entry_time'].apply(_extract_hour)
-                    # Assume market opens at 9:30
-                    return (hours - 9.5) * 60, "minutes since 9:30 AM"
-            
+                if 'entry_time' not in df.columns:
+                    return None, "Blocked: need entry_time"
+                hours = df['entry_time'].apply(_extract_hour)
+                return (hours - 9.5) * 60, "minutes since 9:30 AM (assumed open)"
+
             if 'day_of_week' in col_lower:
-                if 'date' in df.columns:
-                    return _safe_to_datetime(df['date']).dt.dayofweek, "extracted from date"
-        
+                if 'date' not in df.columns:
+                    return None, "Blocked: need date"
+                return _safe_to_datetime(df['date']).dt.dayofweek, "extracted from date"
+
         # Volatility-based
-        if 'volatility' in category.lower() or 'atr' in col_lower:
+        if 'volatility' in cat_lower or 'atr' in col_lower:
             if 'atr' in col_lower:
-                # Would need high/low/close data
-                return None, None
-        
+                return (
+                    None,
+                    "Blocked: need ATR column or OHLC history to compute ATR",
+                )
+
         # Momentum-based
-        if 'momentum' in category.lower():
+        if 'momentum' in cat_lower:
             if 'rsi' in col_lower:
-                return None, None  # Need price history
+                return None, "Blocked: need OHLC/close history to compute RSI"
             if 'macd' in col_lower:
-                return None, None  # Need price history
-        
+                return None, "Blocked: need OHLC/close history to compute MACD"
+
         return None, None
     
     def generate_report(

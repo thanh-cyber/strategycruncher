@@ -93,10 +93,10 @@ def test_report_mode_prefers_entry_column_names():
 
 
 def test_crunch_raises_without_entry_columns():
-    """crunch() must not fall back to generic numeric columns."""
+    """crunch() raises when there is no usable numeric indicator (only PnL or excluded names)."""
     from strategy_cruncher import StrategyCruncher
 
-    df = pd.DataFrame({"net_pnl": [1.0, -1.0, 2.0], "rsi": [30.0, 50.0, 70.0]})
+    df = pd.DataFrame({"net_pnl": [1.0, -1.0, 2.0]})
     cruncher = StrategyCruncher(min_trades_remaining=1, min_improvement_pct=0.0)
     try:
         cruncher.crunch(df, pnl_column="net_pnl", max_rules=1, verbose=False)
@@ -104,7 +104,16 @@ def test_crunch_raises_without_entry_columns():
         assert "crunch()" in str(e)
         assert "Columns in file" in str(e)
     else:
-        raise AssertionError("Expected ValueError when no Entry_Col_* / Col_* columns")
+        raise AssertionError("Expected ValueError when no indicator columns exist")
+
+
+def test_crunch_accepts_wide_format_indicator_names():
+    """CSV-style names (e.g. rsi) work when no Entry_Col_* / Col_* columns are present."""
+    from strategy_cruncher import StrategyCruncher
+
+    df = pd.DataFrame({"net_pnl": [1.0, -1.0, 2.0], "rsi": [30.0, 50.0, 70.0]})
+    cruncher = StrategyCruncher(min_trades_remaining=1, min_improvement_pct=0.0)
+    cruncher.crunch(df, pnl_column="net_pnl", max_rules=1, verbose=False)
 
 
 def test_analyze_legacy_raises_without_entry_columns():
@@ -149,6 +158,8 @@ if __name__ == "__main__":
     print("  [OK] Report entry-column naming test passed")
     test_crunch_raises_without_entry_columns()
     print("  [OK] crunch() entry-column requirement test passed")
+    test_crunch_accepts_wide_format_indicator_names()
+    print("  [OK] Wide-format indicator names test passed")
     test_analyze_legacy_raises_without_entry_columns()
     print("  [OK] analyze(iterative=False) entry-column requirement test passed")
     test_nan_pnl_in_metrics_raises()
