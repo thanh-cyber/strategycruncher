@@ -326,6 +326,8 @@ class StrategyCruncher:
         df: pd.DataFrame,
         pnl_column: str = "net_pnl",
         target_metric: str = "profit_factor",
+        indicator_columns: Optional[List[str]] = None,
+        exclude_columns: Optional[List[str]] = None,
         min_trades: int = 300,
         min_improvement_pct: float = 8.0,
         max_rules: int = 8,
@@ -340,6 +342,9 @@ class StrategyCruncher:
             df: Backtest DataFrame
             pnl_column: P&L column name (net_pnl, profit, etc.)
             target_metric: profit_factor, expectancy, win_rate, total_profit, sharpe_ratio, etc.
+            indicator_columns: Optional explicit indicator list to evaluate in crunch mode.
+                If None, auto-detects entry-style columns.
+            exclude_columns: Optional columns to remove from the crunch candidate list.
             min_trades: Minimum trades after each rule (use aggression factor in the UI)
             min_improvement_pct: Minimum % improvement to accept a rule
             max_rules: Maximum rules to apply
@@ -359,8 +364,30 @@ class StrategyCruncher:
         if pnl_column not in df.columns:
             raise ValueError(f"PnL column '{pnl_column}' not found. Available: {list(df.columns)}")
         
-        # Auto-detect entry columns (no exit columns); no silent fallback
-        self.entry_columns = self._detect_entry_columns(df, pnl_column)
+        # Candidate columns: caller-supplied list or auto-detected entry columns.
+        if indicator_columns is None:
+            self.entry_columns = self._detect_entry_columns(df, pnl_column)
+            source = "auto-detected"
+        else:
+            self.entry_columns = [c for c in indicator_columns if c in df.columns]
+            missing = [c for c in indicator_columns if c not in df.columns]
+            if missing:
+                raise ValueError(
+                    "crunch(): indicator_columns contains missing columns: "
+                    f"{missing!r}. Available: {list(df.columns)!r}"
+                )
+            source = "indicator_columns"
+
+        if exclude_columns:
+            ex = set(exclude_columns)
+            before = list(self.entry_columns)
+            self.entry_columns = [c for c in self.entry_columns if c not in ex]
+            if not self.entry_columns:
+                raise ValueError(
+                    "crunch(): exclude_columns removed every candidate indicator column. "
+                    f"exclude_columns={list(exclude_columns)!r}, {source} columns before filter: {before!r}"
+                )
+
         self._require_entry_columns(df, "crunch()", self.entry_columns)
 
         current_df = df.copy()
@@ -599,6 +626,8 @@ class StrategyCruncher:
                 df,
                 pnl_column=pnl_column,
                 target_metric=self.optimize_metric,
+                indicator_columns=indicator_columns,
+                exclude_columns=exclude_columns,
                 min_trades=self.min_trades_remaining,
                 min_improvement_pct=self.min_improvement_pct,
                 max_rules=max_rules,
